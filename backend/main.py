@@ -1,3 +1,6 @@
+from classifier import classify_ticket
+from pydantic import BaseModel, Field
+
 from fastapi import FastAPI
 from dotenv import load_dotenv
 import os
@@ -11,7 +14,22 @@ print("Loaded API Key:", os.getenv("OPENAI_API_KEY") or "NOT SET!")
 
 client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))  # Client next
 
+class TicketInput(BaseModel):
+    text: str = Field(..., min_length=10, max_length=2000)
+
+class ClassificationResponse(BaseModel):
+    category: str
+    confidence: str = "high"
+
 app = FastAPI(title="Support Swarm Backend")  # App def here—before decorators!
+
+@app.post("/classify", response_model=ClassificationResponse)
+async def classify(ticket: TicketInput):
+    try:
+        category = classify_ticket(ticket.text)
+        return ClassificationResponse(category=category)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
 
 @app.get("/health")
 async def health_check() -> Dict[str, str]:
