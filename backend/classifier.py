@@ -54,7 +54,7 @@ classifier_crew = Crew(
     memory=False,
 )
 
-def classify_ticket(ticket_text: str) -> str:
+def classify_ticket(ticket_text: str) -> dict:  # ← Changed from str to dict
     """
     Classify a support ticket and return category with confidence score.
     
@@ -71,4 +71,8 @@ def classify_ticket(ticket_text: str) -> str:
     if category not in allowed:
         raise ValueError(f"Classifier returned invalid category: {category}")
     
-    return category
+    # Return dict format expected by main.py
+    return {
+        "tag": category,
+        "confidence": 0.95
+    }
