@@ -1,44 +1,166 @@
-from classifier import classify_ticket
-from pydantic import BaseModel, Field
-
-from fastapi import FastAPI
-from dotenv import load_dotenv
 import os
-from openai import OpenAI
-from typing import Dict
+import sys
 
-load_dotenv()  # Env first—pulls key
+# Path for subprocess — adds root and backend explicitly
+project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
+sys.path.insert(0, project_root)
+sys.path.insert(0, os.path.dirname(__file__))  # Backend folder itself
+
+from dotenv import load_dotenv
+
+# Force dotenv from project root — fixes subprocess working dir quirk
+load_dotenv(dotenv_path=os.path.join(project_root, '.env'))  # ← This line crushes the "NOT SET!" error
 
 # Debug print (remove after good)
 print("Loaded API Key:", os.getenv("OPENAI_API_KEY") or "NOT SET!")
 
+from openai import OpenAI
+from fastapi import FastAPI, HTTPException
+from pydantic import BaseModel, Field
+from typing import Optional, Literal
+from crewai import Agent, Task, Crew, Process
+from langchain_openai import ChatOpenAI
+
+# Imports now work — classifier.py is in backend folder, so relative path is fine
+from classifier import classify_ticket
+from tools import search_kb
+
 client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))  # Client next
 
+# ================== MODELS ==================
+
 class TicketInput(BaseModel):
-    text: str = Field(..., min_length=10, max_length=2000)
+    text: str = Field(..., min_length=10, max_length=2000, description="Customer support ticket text")
 
 class ClassificationResponse(BaseModel):
-    category: str
-    confidence: str = "high"
+    tag: str = Field(..., description="Predicted category (bug, refund, etc.)")
+    confidence: float = Field(..., ge=0.0, le=1.0, description="Classification confidence score")
 
-app = FastAPI(title="Support Swarm Backend")  # App def here—before decorators!
+class ResolveOutput(BaseModel):
+    resolved: bool
+    reply: Optional[str] = None
+    confidence: float
+
+class EscalateOutput(BaseModel):
+    summary: str
+    suggested_department: str = "Tier 2 Support"
+    priority: Literal["Low", "Medium", "High", "Urgent"] = "Medium"
+
+class ResolveResponse(BaseModel):
+    status: Literal["resolved", "escalated"]
+    reply: Optional[str] = None
+    summary: Optional[str] = None
+    confidence: Optional[float] = None
+    suggested_department: Optional[str] = None
+    priority: Optional[str] = None
+    tag: str
+
+# ================== AGENTS & TASKS ==================
+
+llm = ChatOpenAI(model="gpt-4o-mini", temperature=0.0)
+
+resolver_agent = Agent(
+    role="Senior Ticket Resolver",
+    goal="Resolve only when KB match ≥0.82. Never guess or hallucinate.",
+    backstory="10+ years in support, knows every edge case of our product.",
+    tools=[search_kb],
+    llm=llm,
+    allow_delegation=False
+)
+
+escalator_agent = Agent(
+    role="Escalation Specialist",
+    goal="Write perfect handoff summaries that humans solve in <5 min.",
+    backstory="Former Zendesk lead, writes summaries that managers love.",
+    llm=llm,
+    allow_delegation=False
+)
+
+resolve_task = Task(
+    description="""
+    1. Use search_kb tool (multiple calls allowed).
+    2. Only if highest_confidence ≥ 0.82 craft polite, complete reply.
+    3. Otherwise resolved=false.
+    Ticket: {ticket_text}
+    Tag: {tag} (class confidence {class_conf:.2f})
+    """,
+    agent=resolver_agent,
+    expected_output="JSON matching ResolveOutput",
+    output_pydantic=ResolveOutput
+)
+
+escalate_task = Task(
+    description="""
+    Create concise, actionable 2-3 sentence summary with issue, tag, key details, sentiment.
+    Ticket: {ticket_text}
+    Tag: {tag}
+    """,
+    agent=escalator_agent,
+    expected_output="JSON matching EscalateOutput",
+    output_pydantic=EscalateOutput
+)
+
+# ================================== FASTAPI APP ==================================
+
+app = FastAPI(title="Support Swarm Backend")
 
 @app.post("/classify", response_model=ClassificationResponse)
-async def classify(ticket: TicketInput):
+async def classify_endpoint(ticket: TicketInput):
     try:
-        category = classify_ticket(ticket.text)
-        return ClassificationResponse(category=category)
+        result = classify_ticket(ticket.text)
+        return ClassificationResponse(tag=result["tag"], confidence=result["confidence"])
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail=f"Classification failed: {str(e)}")
 
-@app.get("/health")
-async def health_check() -> Dict[str, str]:
-    return {"status": "healthy", "message": "Underdog rising—proving them wrong!"}
-
-@app.get("/test-openai")
-async def test_openai() -> Dict[str, str]:
+@app.post("/resolve", response_model=ResolveResponse)
+async def resolve_endpoint(ticket: TicketInput):
     try:
-        client.models.list()  # Connection check
-        return {"status": "connected"}
+        classification = classify_ticket(ticket.text)
+        
+        crew = Crew(agents=[resolver_agent], tasks=[resolve_task], process=Process.sequential, verbose=False)
+        result = crew.kickoff(inputs={
+            "ticket_text": ticket.text,
+            "tag": classification["tag"],
+            "class_conf": classification["confidence"]
+        })
+        
+        if result.resolved:
+            return ResolveResponse(
+                status="resolved",
+                reply=result.reply,
+                confidence=result.confidence,
+                tag=classification["tag"]
+            )
+        
+        # Auto-escalate
+        esc_crew = Crew(agents=[escalator_agent], tasks=[escalate_task], process=Process.sequential)
+        esc_result = esc_crew.kickoff(inputs={
+            "ticket_text": ticket.text,
+            "tag": classification["tag"]
+        })
+        
+        return ResolveResponse(
+            status="escalated",
+            summary=esc_result.summary,
+            suggested_department=esc_result.suggested_department,
+            priority=esc_result.priority,
+            tag=classification["tag"]
+        )
     except Exception as e:
-        return {"error": str(e)}
+        raise HTTPException(status_code=500, detail=f"Resolution failed: {str(e)}")
+
+@app.post("/escalate")
+async def escalate_endpoint(ticket: TicketInput):
+    try:
+        classification = classify_ticket(ticket.text)
+        crew = Crew(agents=[escalator_agent], tasks=[escalate_task], process=Process.sequential)
+        result = crew.kickoff(inputs={"ticket_text": ticket.text, "tag": classification["tag"]})
+        return {
+            "status": "escalated",
+            "summary": result.summary,
+            "suggested_department": result.suggested_department,
+            "priority": result.priority,
+            "tag": classification["tag"]
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Escalation failed: {str(e)}")

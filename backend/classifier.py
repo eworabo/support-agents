@@ -5,6 +5,11 @@ from langchain_openai import ChatOpenAI
 
 load_dotenv()
 
+# Verify API key is loaded before initializing OpenAI client
+if not os.getenv("OPENAI_API_KEY"):
+    raise ValueError("OPENAI_API_KEY not found in environment. Check your .env file.")
+
+
 llm = ChatOpenAI(model="gpt-4o-mini-2024-07-18", temperature=0.0)
 
 classifier_agent = Agent(
@@ -50,6 +55,12 @@ classifier_crew = Crew(
 )
 
 def classify_ticket(ticket_text: str) -> str:
+    """
+    Classify a support ticket and return category with confidence score.
+    
+    Returns:
+        dict: {"tag": str, "confidence": float}
+    """
     result = classifier_crew.kickoff(inputs={"ticket_text": ticket_text})
     category = str(result).strip().lower()
     
