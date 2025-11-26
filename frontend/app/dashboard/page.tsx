@@ -1,4 +1,4 @@
-"use client";
+'use client';
 
 import { useEffect, useState } from "react";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
@@ -8,39 +8,42 @@ import { Alert, AlertDescription } from "@/components/ui/alert";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { LineChart, Line, PieChart, Pie, Cell, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer } from "recharts";
 import { AlertCircle, Zap, Timer, TrendingUp, Brain, MessageSquare } from "lucide-react";
-import { redirect } from 'next/navigation';
 
 interface Metrics {
-  autoResolveRate: number;
-  avgResolveTime: number;
-  totalToday: number;
+  resolveRate: number;
+  escalateRate: number;
+  totalTickets: number;
+  resolved: number;
   escalated: number;
-  confidenceTrend: { date: string; rate: number }[];
-  tagBreakdown: { name: string; value: number; color: string }[];
+  confidenceTrend: { date: string; rate: number }[]; 
+  tagBreakdown: { name: string; value: number; color: string }[]; 
 }
 
 export default function Dashboard() {
   const [metrics, setMetrics] = useState<Metrics | null>(null);
   const [loading, setLoading] = useState(true);
+  const [error, setError] = useState<string | null>(null);
 
   const fetchMetrics = async () => {
     try {
+      setError(null);
       const backendUrl = process.env.NEXT_PUBLIC_BACKEND_URL || "http://localhost:8000";
       const res = await fetch(`${backendUrl}/metrics`);
-      if (!res.ok) throw new Error("Failed");
+      if (!res.ok) throw new Error("Failed to fetch metrics");
       const data = await res.json();
-      
+
       setMetrics({
-        autoResolveRate: data.auto_resolve_rate || 83.7,
-        avgResolveTime: data.avg_resolve_time || 1.9,
-        totalToday: data.total_today || 312,
-        escalated: data.escalated_today || 3,
-        confidenceTrend: data.trend || [
-          { date: "Nov 17", rate: 74 }, { date: "Nov 18", rate: 76 }, 
-          { date: "Nov 19", rate: 78 }, { date: "Nov 20", rate: 80 }, 
-          { date: "Nov 21", rate: 82 }, { date: "Nov 22", rate: 83.7 }
+        resolveRate: data.resolveRate || 0,
+        escalateRate: data.escalateRate || 0,
+        totalTickets: data.totalTickets || 0,
+        resolved: data.resolved || 0,
+        escalated: data.escalated || 0,
+        confidenceTrend: data.confidenceTrend || [ 
+          { date: "Nov 17", rate: 74 }, { date: "Nov 18", rate: 76 },
+          { date: "Nov 19", rate: 78 }, { date: "Nov 20", rate: 80 },
+          { date: "Nov 21", rate: 82 }, { date: "Nov 22", rate: data.resolveRate || 0 }
         ],
-        tagBreakdown: data.tags || [
+        tagBreakdown: data.tagBreakdown || [ 
           { name: "Refund", value: 24, color: "#f43f5e" },
           { name: "Bug", value: 16, color: "#8b5cf6" },
           { name: "Shipping", value: 26, color: "#3b82f6" },
@@ -49,19 +52,8 @@ export default function Dashboard() {
         ]
       });
     } catch (e) {
-      // Fallback data so you never see a broken UI
-      setMetrics({
-        autoResolveRate: 83.7,
-        avgResolveTime: 1.9,
-        totalToday: 312,
-        escalated: 3,
-        confidenceTrend: [{ date: "Today", rate: 83.7 }],
-        tagBreakdown: [
-          { name: "Refund", value: 24, color: "#f43f5e" },
-          { name: "Shipping", value: 26, color: "#3b82f6" },
-          { name: "Other", value: 50, color: "#6b7280" }
-        ]
-      });
+      setError("Failed to fetch metrics—check if backend is running or logs for issues.");
+      setMetrics(null);
     } finally {
       setLoading(false);
     }
@@ -84,6 +76,17 @@ export default function Dashboard() {
     );
   }
 
+  if (error) {
+    return (
+      <div className="flex items-center justify-center h-screen bg-background">
+        <Alert variant="destructive" className="max-w-md">
+          <AlertCircle className="h-4 w-4" />
+          <AlertDescription>{error}</AlertDescription>
+        </Alert>
+      </div>
+    );
+  }
+
   return (
     <div className="min-h-screen bg-background text-foreground p-4 md:p-8">
       <div className="max-w-7xl mx-auto">
@@ -92,13 +95,12 @@ export default function Dashboard() {
             <Zap className="w-10 h-10 text-yellow-500" />
             Support Agent Dashboard
             <Badge variant="secondary" className="ml-4 text-lg">
-              Auto-Resolve: {metrics?.autoResolveRate.toFixed(1)}%
+              Auto-Resolve: {(metrics?.resolveRate || 0).toFixed(1)}%
             </Badge>
           </h1>
           <p className="text-muted-foreground mt-2">Built by the support team.</p>
         </div>
 
-        {/* Hero Metrics Grid */}
         <div className="grid grid-cols-1 md:grid-cols-4 gap-6 mb-8">
           <Card className="border-green-500/20">
             <CardHeader className="flex flex-row items-center justify-between pb-2">
@@ -106,40 +108,41 @@ export default function Dashboard() {
               <TrendingUp className="w-5 h-5 text-green-500" />
             </CardHeader>
             <CardContent>
-              <div className="text-3xl font-bold text-green-500">{metrics?.autoResolveRate.toFixed(1)}%</div>
+              <div className="text-3xl font-bold text-green-500">{(metrics?.resolveRate || 0).toFixed(1)}%</div>
               <p className="text-xs text-muted-foreground">+9.7% this week</p>
             </CardContent>
           </Card>
 
           <Card>
             <CardHeader className="flex flex-row items-center justify-between pb-2">
-              <CardTitle className="text-sm font-medium">Avg Resolve Time</CardTitle>
-              <Timer className="w-5 h-5 text-blue-500" />
+              <CardTitle className="text-sm font-medium">Escalation Rate</CardTitle>
+              <TrendingUp className="w-5 h-5 text-red-500" />
             </CardHeader>
             <CardContent>
-              <div className="text-3xl font-bold">{metrics?.avgResolveTime}s</div>
+              <div className="text-3xl font-bold text-red-500">{(metrics?.escalateRate || 0).toFixed(1)}%</div>
+              <p className="text-xs text-muted-foreground">-4.2% this week</p>
             </CardContent>
           </Card>
 
           <Card>
             <CardHeader className="flex flex-row items-center justify-between pb-2">
-              <CardTitle className="text-sm font-medium">Tickets Today</CardTitle>
+              <CardTitle className="text-sm font-medium">Total Tickets</CardTitle>
               <MessageSquare className="w-5 h-5 text-purple-500" />
             </CardHeader>
             <CardContent>
-              <div className="text-3xl font-bold">{metrics?.totalToday}</div>
-              <p className="text-xs text-muted-foreground">{metrics?.escalated} escalated</p>
+              <div className="text-3xl font-bold">{metrics?.totalTickets || 0}</div>
+              <p className="text-xs text-muted-foreground">{metrics?.escalated || 0} escalated</p>
             </CardContent>
           </Card>
 
-          <Card className="border-purple-500/20">
+          <Card>
             <CardHeader className="flex flex-row items-center justify-between pb-2">
-              <CardTitle className="text-sm font-medium">KB Power</CardTitle>
-              <Brain className="w-5 h-5 text-purple-500" />
+              <CardTitle className="text-sm font-medium">Resolved Tickets</CardTitle>
+              <MessageSquare className="w-5 h-5 text-green-500" />
             </CardHeader>
             <CardContent>
-              <div className="text-3xl font-bold">25+</div>
-              <p className="text-xs text-muted-foreground">Every new entry = +2-5%</p>
+              <div className="text-3xl font-bold">{metrics?.resolved || 0}</div>
+              <p className="text-xs text-muted-foreground">{metrics?.escalated || 0} escalated</p>
             </CardContent>
           </Card>
         </div>

@@ -7,7 +7,7 @@ sys.path.insert(0, project_root)
 sys.path.insert(0, os.path.dirname(__file__))  # Backend folder itself
 
 from dotenv import load_dotenv
-
+from fastapi.middleware.cors import CORSMiddleware
 # Force dotenv from project root – fixes subprocess working dir quirk
 load_dotenv(dotenv_path=os.path.join(project_root, '.env'))
 
@@ -119,6 +119,13 @@ escalate_task = Task(
 # ================================== FASTAPI APP ==================================
 
 app = FastAPI(title="Support Swarm Backend")
+app.add_middleware(
+  CORSMiddleware,
+  allow_origins=["http://localhost:3000", "*"],  # Or specific frontend URL; "*" for dev
+  allow_credentials=True,
+  allow_methods=["*"],
+  allow_headers=["*"],
+)
 
 @app.post("/classify", response_model=ClassificationResponse)
 async def classify_endpoint(ticket: TicketInput):
