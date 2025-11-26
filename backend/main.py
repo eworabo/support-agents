@@ -12,17 +12,34 @@ from dotenv import load_dotenv
 load_dotenv(dotenv_path=os.path.join(project_root, '.env'))
 
 from openai import OpenAI
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Depends
 from pydantic import BaseModel, Field
 from typing import Optional, Literal
 from crewai import Agent, Task, Crew, Process
 from langchain_openai import ChatOpenAI
 from tools import search_kb
+from sqlalchemy import select, func
+from sqlalchemy.ext.asyncio import create_async_engine, async_sessionmaker, AsyncSession
+import logging
+from models import Ticket  # Import from your new models.py in backend/
 # Imports now work – classifier.py is in backend folder, so relative path is fine
 from classifier import classify_ticket
 # from tools import search_kb  # Temporarily disabled while fixing tool format
 
 client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+# Async DB setup for scalable queries
+DATABASE_URL = os.getenv("DATABASE_URL")
+if not DATABASE_URL:
+    raise ValueError("DATABASE_URL not set in .env")
+engine = create_async_engine(DATABASE_URL, echo=True)  # echo=False in prod
+AsyncSessionLocal = async_sessionmaker(engine, expire_on_commit=False)
+
+logger = logging.getLogger(__name__)
+logging.basicConfig(level=logging.ERROR)  # Only log errors in production
+async def get_db() -> AsyncSession:
+    async with AsyncSessionLocal() as session:
+        yield session
+
 
 # ================== MODELS ==================
 
@@ -170,3 +187,24 @@ async def escalate_endpoint(ticket: TicketInput):
         }
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Escalation failed: {str(e)}")
+
+@app.get("/metrics")
+async def get_metrics(db: AsyncSession = Depends(get_db)):
+    try:
+        total_tickets = (await db.execute(select(func.count(Ticket.id)))).scalar_one_or_none() or 0
+        resolved = (await db.execute(select(func.count(Ticket.id)).where(Ticket.status == 'resolved'))).scalar_one_or_none() or 0
+        escalated = (await db.execute(select(func.count(Ticket.id)).where(Ticket.status == 'escalated'))).scalar_one_or_none() or 0
+
+        resolve_rate = round((resolved / total_tickets * 100), 1) if total_tickets > 0 else 0.0
+        escalate_rate = round((escalated / total_tickets * 100), 1) if total_tickets > 0 else 0.0
+
+        return {
+            'resolveRate': resolve_rate,
+            'escalateRate': escalate_rate,
+            'totalTickets': total_tickets,
+            'resolved': resolved,
+            'escalated': escalated
+        }
+    except Exception as e:
+        logger.error(f"Metrics error: {str(e)}")
+        raise HTTPException(status_code=500, detail="Failed to fetch metrics")
