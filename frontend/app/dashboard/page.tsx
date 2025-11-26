@@ -8,6 +8,7 @@ import { Alert, AlertDescription } from "@/components/ui/alert";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { LineChart, Line, PieChart, Pie, Cell, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer } from "recharts";
 import { AlertCircle, Zap, Timer, TrendingUp, Brain, MessageSquare } from "lucide-react";
+import { redirect } from 'next/navigation';
 
 interface Metrics {
   autoResolveRate: number;
