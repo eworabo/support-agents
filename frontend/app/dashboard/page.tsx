@@ -11,6 +11,8 @@ import { AlertCircle, Zap, Timer, TrendingUp, Brain, MessageSquare } from "lucid
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table";
 import Link from "next/link";
 import { ArrowUpRight, Trash2 } from "lucide-react";
+import { DndProvider, useDrag, useDrop } from 'react-dnd';
+import { HTML5Backend } from 'react-dnd-html5-backend';
 
 interface Metrics {
   resolveRate: number;
@@ -30,11 +32,19 @@ interface Ticket {
   tag: string;
 }
 
+interface KBEntry {
+  id: number;
+  title: string;
+  content: string;
+}
+
 export default function Dashboard() {
   const [metrics, setMetrics] = useState<Metrics | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [escalatedTickets, setEscalatedTickets] = useState<Ticket[]>([]);
+  const [kbEntries, setKBEntries] = useState<KBEntry[]>([]);
+
   
 
   const fetchMetrics = async () => {
@@ -85,6 +95,34 @@ export default function Dashboard() {
     }
   };
 
+  const fetchKBEntries = async () => {
+    try {
+      const backendUrl = process.env.NEXT_PUBLIC_BACKEND_URL || "http://localhost:8000";
+      const res = await fetch(`${backendUrl}/kb`);
+      if (!res.ok) throw new Error("Failed to fetch KB entries");
+      const data = await res.json();
+      setKBEntries(data.items || []);  // Real entries or fallback empty
+    } catch (e) {
+      setError("Failed to fetch KB entries—check backend.");
+      setKBEntries([]);
+    }
+  };
+
+  const saveKB = async () => {
+    try {
+      const backendUrl = process.env.NEXT_PUBLIC_BACKEND_URL || "http://localhost:8000";
+      const res = await fetch(`${backendUrl}/kb`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ title: 'New Title', content: 'New Content' })  // Replace with form input
+      });
+      if (!res.ok) throw new Error("Failed to save KB");
+      fetchKBEntries();  // Refresh list
+    } catch (e) {
+      setError("Failed to save KB—check backend.");
+    }
+  };    
+
   useEffect(() => {
     fetchMetrics();
     const interval = setInterval(fetchMetrics, 5000);
@@ -93,6 +131,7 @@ export default function Dashboard() {
 
   useEffect(() => {
     fetchMetrics();
+    fetchKBEntries();
     fetchEscalatedTickets();  // Added
     const interval = setInterval(() => {
       fetchMetrics();
@@ -228,9 +267,16 @@ export default function Dashboard() {
           <TabsContent value="kb">
             <Card>
               <CardHeader><CardTitle>Knowledge Base Editor</CardTitle></CardHeader>
-              <CardContent className="text-center py-12">
-                <Brain className="w-16 h-16 mx-auto mb-4 text-purple-500" />
-                <p className="text-lg">Full drag-and-drop KB editor with auto-rebuild drops in {"<"} 20 minutes.</p>
+              <CardContent>
+                <div className="space-y-4">
+                  {kbEntries.map((entry, index) => (
+                    <div key={entry.id} className="p-4 border rounded">
+                      <h3>{entry.title}</h3>
+                      <p>{entry.content}</p>
+                    </div>
+                  ))}
+                </div>
+                <Button onClick={saveKB}>Save and Rebuild Vector DB</Button>
               </CardContent>
             </Card>
           </TabsContent>

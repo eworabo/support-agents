@@ -14,3 +14,9 @@ class Ticket(Base):
     priority = Column(String(50))  # 'Low', 'Medium', 'High', 'Urgent'
     department = Column(String(50))  # 'Tier 2 Support'
     tag = Column(String(50))  # 'bug', 'refund', etc.
+
+class KBEntry(Base):
+    __tablename__ = 'kb_entries'
+    id = Column(Integer, primary_key=True)
+    title = Column(String(255), nullable=False)
+    content = Column(Text, nullable=False)

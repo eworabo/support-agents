@@ -13,8 +13,7 @@ load_dotenv(dotenv_path=os.path.join(project_root, '.env'))
 
 from openai import OpenAI
 from fastapi import FastAPI, HTTPException, Depends, Query
-#   from fastapi_pagination import Page, paginate
-#from fastapi_pagination.ext.async_sqlalchemy import paginate as async_paginate
+from models import Ticket, KBEntry
 from pydantic import BaseModel, Field
 from typing import Optional, Literal
 from crewai import Agent, Task, Crew, Process
@@ -23,7 +22,7 @@ from tools import search_kb
 from sqlalchemy import select, func
 from sqlalchemy.ext.asyncio import create_async_engine, async_sessionmaker, AsyncSession
 import logging
-from models import Ticket  # Import from your new models.py in backend/
+ # Import from your new models.py in backend/
 # Imports now work – classifier.py is in backend folder, so relative path is fine
 from classifier import classify_ticket
 # from tools import search_kb  # Temporarily disabled while fixing tool format
@@ -81,6 +80,15 @@ class TicketOut(BaseModel):
 
 class TicketDetail(TicketOut):
     content: str | None
+
+class KBEntryOut(BaseModel):
+    id: int
+    title: str
+    content: str
+
+class KBEntryIn(BaseModel):
+    title: str
+    content: str
 
 # ================== AGENTS & TASKS ==================
 
@@ -254,3 +262,35 @@ async def get_escalate_detail(id: int, db: AsyncSession = Depends(get_db)):
     except Exception as e:
         logger.error(f"Escalate detail error: {str(e)}")
         raise HTTPException(status_code=500, detail="Failed to fetch ticket detail")
+
+@app.get("/kb")
+async def get_kb_list(page: int = Query(1, ge=1), size: int = Query(10, ge=1, le=100), db: AsyncSession = Depends(get_db)):
+    try:
+        stmt = select(KBEntry).offset((page - 1) * size).limit(size)
+        results = await db.execute(stmt)
+        entries = results.scalars().all()
+        total_stmt = select(func.count(KBEntry.id))
+        total = (await db.execute(total_stmt)).scalar() or 0
+        return {"items": entries, "total": total, "page": page, "size": size, "pages": (total + size - 1) // size}
+    except Exception as e:
+        logger.error(f"KB list error: {str(e)}")
+        raise HTTPException(status_code=500, detail="Failed to fetch KB entries")
+
+@app.post("/kb")
+async def save_kb_entry(entry: KBEntryIn, db: AsyncSession = Depends(get_db)):
+    try:
+        new_entry = KBEntry(title=entry.title, content=entry.content)
+        db.add(new_entry)
+        await db.commit()
+        await db.refresh(new_entry)
+        
+        # Optional: Rebuild vector DB if you have that endpoint
+        # import httpx
+        # async with httpx.AsyncClient() as client:
+        #     await client.post("http://127.0.0.1:8000/api/rebuild-vectordb")
+        
+        return new_entry
+    except Exception as e:
+        await db.rollback()
+        logger.error(f"KB save error: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Failed to save KB entry: {str(e)}")
