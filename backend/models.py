@@ -1,4 +1,4 @@
-from sqlalchemy import Column, Integer, String
+from sqlalchemy import Column, Integer, String, Text
 from sqlalchemy.ext.asyncio import AsyncAttrs
 from sqlalchemy.orm import DeclarativeBase
 
@@ -8,8 +8,9 @@ class Base(AsyncAttrs, DeclarativeBase):
 class Ticket(Base):
     __tablename__ = 'tickets'
     id = Column(Integer, primary_key=True)
-    status = Column(String(50), nullable=False)  # e.g., 'resolved', 'escalated', 'pending'
-    # Add more fields here as your project grows, e.g.:
-    # user_id = Column(Integer)
-    # created_at = Column(DateTime, default=func.now())
-    # content = Column(Text)
+    status = Column(String(50), nullable=False)  # 'resolved', 'escalated', 'pending'
+    content = Column(Text)  # Customer ticket text
+    summary = Column(String(255))  # Escalation summary
+    priority = Column(String(50))  # 'Low', 'Medium', 'High', 'Urgent'
+    department = Column(String(50))  # 'Tier 2 Support'
+    tag = Column(String(50))  # 'bug', 'refund', etc.

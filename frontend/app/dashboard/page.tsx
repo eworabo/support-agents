@@ -8,6 +8,9 @@ import { Alert, AlertDescription } from "@/components/ui/alert";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { LineChart, Line, PieChart, Pie, Cell, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer } from "recharts";
 import { AlertCircle, Zap, Timer, TrendingUp, Brain, MessageSquare } from "lucide-react";
+import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table";
+import Link from "next/link";
+import { ArrowUpRight, Trash2 } from "lucide-react";
 
 interface Metrics {
   resolveRate: number;
@@ -19,10 +22,20 @@ interface Metrics {
   tagBreakdown: { name: string; value: number; color: string }[]; 
 }
 
+interface Ticket {
+  id: number;
+  summary: string;
+  priority: string;
+  department: string;
+  tag: string;
+}
+
 export default function Dashboard() {
   const [metrics, setMetrics] = useState<Metrics | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
+  const [escalatedTickets, setEscalatedTickets] = useState<Ticket[]>([]);
+  
 
   const fetchMetrics = async () => {
     try {
@@ -59,9 +72,32 @@ export default function Dashboard() {
     }
   };
 
+  const fetchEscalatedTickets = async () => {
+    try {
+      const backendUrl = process.env.NEXT_PUBLIC_BACKEND_URL || "http://localhost:8000";
+      const res = await fetch(`${backendUrl}/escalate`);
+      if (!res.ok) throw new Error("Failed to fetch escalated tickets");
+      const data = await res.json();
+      setEscalatedTickets(data.items || []);  // Real tickets or fallback empty array
+    } catch (e) {
+      setError("Failed to fetch escalated tickets—check backend.");
+      setEscalatedTickets([]);  // Fallback empty on error
+    }
+  };
+
   useEffect(() => {
     fetchMetrics();
     const interval = setInterval(fetchMetrics, 5000);
+    return () => clearInterval(interval);
+  }, []);
+
+  useEffect(() => {
+    fetchMetrics();
+    fetchEscalatedTickets();  // Added
+    const interval = setInterval(() => {
+      fetchMetrics();
+      fetchEscalatedTickets();  // Added
+    }, 5000);
     return () => clearInterval(interval);
   }, []);
 
@@ -202,10 +238,42 @@ export default function Dashboard() {
           <TabsContent value="queue">
             <Card>
               <CardHeader><CardTitle>Escalation Queue</CardTitle></CardHeader>
-              <CardContent className="text-center py-12">
-                <Badge variant="destructive" className="mb-4">3 LIVE</Badge>
-                <p className="text-lg font-medium">"Where is my refund???"</p>
-                <Button size="lg" className="mt-4">Resolve & Learn → Never again</Button>
+              <CardContent>
+                <Table>
+                  <TableHeader>
+                    <TableRow>
+                      <TableHead>ID</TableHead>
+                      <TableHead>Summary</TableHead>
+                      <TableHead>Priority</TableHead>
+                      <TableHead>Department</TableHead>
+                      <TableHead>Tag</TableHead>
+                      <TableHead>Actions</TableHead>
+                    </TableRow>
+                  </TableHeader>
+                  <TableBody>
+                    {escalatedTickets.map((ticket) => (
+                      <TableRow key={ticket.id}>
+                        <TableCell>{ticket.id}</TableCell>
+                        <TableCell>{ticket.summary}</TableCell>
+                        <TableCell>
+                          <Badge variant={ticket.priority === 'Urgent' ? 'destructive' : 'default'}>{ticket.priority}</Badge>
+                        </TableCell>
+                        <TableCell>{ticket.department}</TableCell>
+                        <TableCell>{ticket.tag}</TableCell>
+                        <TableCell>
+                          <Button variant="ghost" size="icon" asChild>
+                            <Link href={`/escalate/${ticket.id}`}>
+                              <ArrowUpRight className="h-4 w-4" />
+                            </Link>
+                          </Button>
+                          <Button variant="ghost" size="icon">
+                            <Trash2 className="h-4 w-4" />
+                          </Button>
+                        </TableCell>
+                      </TableRow>
+                    ))}
+                  </TableBody>
+                </Table>
               </CardContent>
             </Card>
           </TabsContent>
