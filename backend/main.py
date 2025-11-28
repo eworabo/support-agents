@@ -314,3 +314,22 @@ async def save_kb_entry(
         await db.rollback()
         logger.error(f"KB save error: {str(e)}")
         raise HTTPException(status_code=500, detail=f"Failed to save KB entry: {str(e)}")
+
+@app.delete("/kb/{id}")
+async def delete_kb_entry(id: int, db: AsyncSession = Depends(get_db)):
+    try:
+        stmt = select(KBEntry).where(KBEntry.id == id)
+        result = await db.execute(stmt)
+        entry = result.scalar_one_or_none()
+        
+        if not entry:
+            raise HTTPException(status_code=404, detail="KB entry not found")
+        
+        await db.delete(entry)
+        await db.commit()
+        
+        return {"message": "KB entry deleted successfully"}
+    except Exception as e:
+        await db.rollback()
+        logger.error(f"KB delete error: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Failed to delete KB entry: {str(e)}")

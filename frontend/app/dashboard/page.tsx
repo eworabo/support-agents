@@ -52,7 +52,7 @@ export default function Dashboard() {
   const [newContent, setNewContent] = useState('');
   const [newFiles, setNewFiles] = useState<File[]>([]);
   
-  const DraggableEntry = ({ entry, index, moveEntry }) => {
+  const DraggableEntry = ({ entry, index, moveEntry, deleteKBEntry }) => {
     const [, drop] = useDrop({
       accept: 'entry',
       hover: (item: { index: number }) => {
@@ -71,28 +71,59 @@ export default function Dashboard() {
       }),
     });
   
+    const fileUrls = entry.file_url 
+      ? entry.file_url.split(',').map(url => url.trim()).filter(url => url) 
+      : [];
+    
     return (
       <div ref={(node) => drag(drop(node))} className={`p-4 border rounded ${isDragging ? 'opacity-50' : ''}`}>
-        <h3 className="font-bold">{entry.title}</h3>
-        <p className="text-sm text-muted-foreground">{entry.content}</p>
+        {/* Title with delete button */}
+        <div className="flex items-center justify-between mb-2">
+          <h3 className="font-bold">{entry.title}</h3>
+          <Button
+            variant="ghost"
+            size="sm"
+            onClick={(e) => {
+              e.stopPropagation();  // Prevent drag from triggering
+              deleteKBEntry(entry.id);
+            }}
+            className="text-red-500 hover:text-red-700 hover:bg-red-50"
+          >
+            <Trash2 className="h-4 w-4" />
+          </Button>
+        </div>
         
-        {/* FIX: Split the URLs by comma and render a link for each one */}
-        {entry.file_url && entry.file_url.split(',').map((url, i) => {
-          // Optional: Extract a clean filename for display (e.g., "manual.pdf")
-          const fileName = decodeURIComponent(url.split('/').pop() || `Attachment ${i + 1}`);
-          
-          return (
-            <a 
-              key={i}
-              href={url.trim()} 
-              target="_blank" 
-              rel="noopener noreferrer" 
-              className="text-blue-500 hover:underline text-sm mt-2 block" 
-            >
-              📎 {fileName}
-            </a>
-          );
-        })}
+        {/* Content area with scroll */}
+        <div 
+          className="text-sm text-muted-foreground max-h-20 overflow-y-auto my-2 pr-2 border rounded p-2 bg-muted/30"
+          style={{
+            overflowY: 'scroll',
+            scrollbarWidth: 'thin',
+            WebkitOverflowScrolling: 'touch'
+          }}
+        >
+          {entry.content}
+        </div>
+        
+        {/* File attachments */}
+        {fileUrls.length > 0 && (
+          <div className="mt-2 space-y-1">
+            {fileUrls.map((url, idx) => {
+              const filename = url.split('/').pop() || `Attachment ${idx + 1}`;
+              return (
+                <a 
+                  key={idx}
+                  href={url} 
+                  target="_blank" 
+                  rel="noopener noreferrer" 
+                  className="text-blue-500 hover:underline text-sm block"
+                >
+                  📎 {filename}
+                </a>
+              );
+            })}
+          </div>
+        )}
       </div>
     );
   };
@@ -202,7 +233,6 @@ export default function Dashboard() {
   };
 
 
-
   const fetchEscalatedTickets = async () => {
     try {
       const backendUrl = process.env.NEXT_PUBLIC_BACKEND_URL || "http://localhost:8000";
@@ -213,6 +243,27 @@ export default function Dashboard() {
     } catch (e) {
       setError("Failed to fetch escalated tickets—check backend.");
       setEscalatedTickets([]);
+    }
+  };
+
+  const deleteKBEntry = async (id: number) => {
+    if (!confirm("Are you sure you want to delete this entry?")) return;
+    
+    try {
+      const backendUrl = process.env.NEXT_PUBLIC_BACKEND_URL || "http://localhost:8000";
+      const res = await fetch(`${backendUrl}/kb/${id}`, {
+        method: 'DELETE',
+      });
+      
+      if (!res.ok) throw new Error("Failed to delete KB entry");
+      
+      // Remove from local state immediately
+      setKBEntries(prev => prev.filter(entry => entry.id !== id));
+      
+      console.log("✅ Entry deleted successfully!");
+    } catch (e) {
+      console.error("❌ Delete error:", e);
+      alert("Failed to delete entry");
     }
   };
 
@@ -359,17 +410,11 @@ export default function Dashboard() {
 
           <TabsContent value="kb">
             <Card>
-            <CardHeader className="flex flex-row items-center justify-between">
-              <CardTitle>Knowledge Base Editor</CardTitle>
-              <Button variant="outline" size="sm" onClick={fetchKBEntries}>
-                Refresh
-              </Button>
-            </CardHeader>
               <CardContent>
                 <DndProvider backend={HTML5Backend}>
                   <div className="space-y-4">
                     {kbEntries.map((entry, index) => (
-                      <DraggableEntry key={entry.id} entry={entry} index={index} moveEntry={moveEntry} />
+                      <DraggableEntry key={entry.id} entry={entry} index={index} moveEntry={moveEntry} deleteKBEntry={deleteKBEntry} />
                     ))}
                   </div>
                 </DndProvider>
