@@ -16,6 +16,8 @@ import { HTML5Backend } from 'react-dnd-html5-backend';
 import { TouchBackend } from 'react-dnd-touch-backend';  // For mobile
 import { Input } from "@/components/ui/input";
 import { Textarea } from "@/components/ui/textarea";  // Separate import for Textarea
+import { Dialog, DialogContent, DialogHeader, DialogTitle, DialogDescription, DialogFooter } from "@/components/ui/dialog";
+import { Check } from "lucide-react"; // For the resolve button icon
 
 interface Metrics {
   resolveRate: number;
@@ -51,6 +53,11 @@ export default function Dashboard() {
   const [newTitle, setNewTitle] = useState('');
   const [newContent, setNewContent] = useState('');
   const [newFiles, setNewFiles] = useState<File[]>([]);
+  const [learnOpen, setLearnOpen] = useState(false);
+  const [learnTitle, setLearnTitle] = useState('');
+  const [learnContent, setLearnContent] = useState('');
+  const [learnFiles, setLearnFiles] = useState<File[]>([]);
+  const [selectedTicket, setSelectedTicket] = useState<Ticket | null>(null);
   
   const DraggableEntry = ({ entry, index, moveEntry, deleteKBEntry }) => {
     const [, drop] = useDrop({
@@ -189,49 +196,78 @@ export default function Dashboard() {
     // Save reordered to backend if needed (add POST /kb/reorder endpoint later)
   };
 
-  const saveKBEntry = async () => {
+  const saveKBEntry = async (title: string, content: string, files: File[]) => {
     console.log("🔵 Save button clicked!");
-    console.log("📝 Title:", newTitle);
-    console.log("📝 Content:", newContent);
-    console.log("📎 Files:", newFiles);
+    console.log("📝 Title:", title);
+    console.log("📝 Content:", content);
+    console.log("📎 Files:", files);
+
+    if (title === newTitle) {  // If from KB tab
+      setNewTitle('');
+      setNewContent('');
+      setNewFiles([]);
+    } else {  // From modal
+      setLearnTitle('');
+      setLearnContent('');
+      setLearnFiles([]);
+    }
     
+    let res;  // Declare outside
     try {
       const backendUrl = process.env.NEXT_PUBLIC_BACKEND_URL || "http://localhost:8000";
       const formData = new FormData();
-      formData.append('title', newTitle);
-      formData.append('content', newContent);
+      formData.append('title', title);
+      formData.append('content', content);
+      (files || []).forEach(file => formData.append('files', file));
       
-      newFiles.forEach(file => {
-        formData.append('files', file);
-      });
-      
-      console.log("🚀 Sending request to backend...");
-      
-      const res = await fetch(`${backendUrl}/kb`, {
+      res = await fetch(`${backendUrl}/kb`, {
         method: 'POST',
         body: formData
       });
       
-      console.log("✅ Response status:", res.status);
+      if (!res.ok) {
+        throw new Error(`Server error: ${res.status}`);
+      }
       
-      if (!res.ok) throw new Error("Failed to save KB");
-      
-      const data = await res.json();
-      console.log("✅ Save successful! Data:", data);
-      
-      alert("✅ KB entry saved successfully!");  // Temporary confirmation
-      
-      setNewTitle('');
-      setNewContent('');
-      setNewFiles([]);
-      fetchKBEntries();
+      await fetchKBEntries();
+      return true;
     } catch (e) {
-      console.error("❌ Save error:", e);
-      alert("❌ Failed to save: " + e.message);
+      if (res) {
+        console.error("Save status:", res.status);
+        const errorText = await res.text();
+        console.error("Error details:", errorText);
+      } else {
+        console.error("Network or fetch error:", e);
+      }
       setError("Failed to save KB—check backend.");
+      return false;
     }
   };
 
+  const resolveTicket = async (id: number) => {
+    try {
+      const backendUrl = process.env.NEXT_PUBLIC_BACKEND_URL || "http://localhost:8000";
+      const res = await fetch(`${backendUrl}/tickets/${id}/resolve`, { method: 'POST' });
+      if (!res.ok) throw new Error("Failed to resolve ticket");
+      await fetchEscalatedTickets();  // Refresh queue
+      await fetchMetrics();  // Update dashboard numbers
+      return true;
+    } catch (e) {
+      console.error("Resolve error:", e);
+      setError("Failed to resolve ticket—check backend.");
+      return false;
+    }
+  };
+
+  const handleSaveLearn = async () => {
+    if (!selectedTicket) return;
+    const success = await saveKBEntry(learnTitle, learnContent, learnFiles);
+    if (success) {
+      await resolveTicket(selectedTicket.id);
+      setLearnOpen(false);
+      setSelectedTicket(null);  // Clean up
+    }
+  };
 
   const fetchEscalatedTickets = async () => {
     try {
@@ -266,6 +302,14 @@ export default function Dashboard() {
       alert("Failed to delete entry");
     }
   };
+
+  useEffect(() => {
+    if (selectedTicket) {
+      setLearnTitle(`Resolution for Ticket #${selectedTicket.id}: ${selectedTicket.summary}`);
+      setLearnContent(selectedTicket.content || selectedTicket.summary || '');
+      setLearnFiles([]);
+    }
+  }, [selectedTicket]);
 
   useEffect(() => {
     fetchMetrics();
@@ -451,7 +495,7 @@ export default function Dashboard() {
                   }} 
                   className="mt-2" 
                 />
-                <Button onClick={saveKBEntry} className="mt-4">Save and Rebuild Vector DB</Button>    
+                <Button onClick={() => saveKBEntry(newTitle, newContent, newFiles)} className="mt-4">Save and Rebuild Vector DB</Button>   
               </CardContent>
             </Card>
           </TabsContent>
@@ -491,6 +535,22 @@ export default function Dashboard() {
                             <Trash2 className="h-4 w-4" />
                           </Button>
                         </TableCell>
+                        <TableCell className="flex space-x-2">
+                          <Button variant="ghost" size="icon" onClick={async () => {
+                            // Your existing detail fetch/link if any
+                          }}>
+                            <ArrowUpRight className="h-4 w-4" />
+                          </Button>
+                          <Button variant="ghost" size="icon" onClick={() => {
+                            setSelectedTicket(ticket);
+                            setLearnOpen(true);
+                          }}>
+                            <Check className="h-4 w-4" />
+                          </Button>
+                          <Button variant="ghost" size="icon" onClick={() => deleteTicket(ticket.id)}>
+                            <Trash2 className="h-4 w-4" />
+                          </Button>
+                        </TableCell>
                       </TableRow>
                     ))}
                   </TableBody>
@@ -499,6 +559,50 @@ export default function Dashboard() {
             </Card>
           </TabsContent>
         </Tabs>
+
+        <Dialog open={learnOpen} onOpenChange={setLearnOpen}>
+          <DialogContent>
+            <DialogHeader>
+              <DialogTitle>Resolve & Learn</DialogTitle>
+              <DialogDescription>Document the resolution to teach the AI.</DialogDescription>
+            </DialogHeader>
+            <Input value={learnTitle} onChange={(e) => setLearnTitle(e.target.value)} placeholder="Title" className="mt-4" />
+            <Textarea value={learnContent} onChange={(e) => setLearnContent(e.target.value)} placeholder="Content" className="mt-2" />
+            
+            {/* Show selected files */}
+            {learnFiles.length > 0 && (
+              <div className="mt-4 space-y-2">
+                <p className="text-sm font-medium">Selected files ({learnFiles.length}):</p>
+                {learnFiles.map((file, idx) => (
+                  <div key={idx} className="flex items-center justify-between bg-muted p-2 rounded">
+                    <span className="text-sm">📎 {file.name}</span>
+                    <Button 
+                      variant="ghost" 
+                      size="sm"
+                      onClick={() => setLearnFiles(prev => prev.filter((_, i) => i !== idx))}
+                    >
+                      Remove
+                    </Button>
+                  </div>
+                ))}
+              </div>
+            )}
+            
+            <Input 
+              type="file" 
+              multiple
+              onChange={(e) => {
+                const selectedFiles = Array.from(e.target.files || []);
+                setLearnFiles(prev => [...prev, ...selectedFiles]);
+                e.target.value = '';
+              }} 
+              className="mt-2" 
+            />
+            <DialogFooter>
+              <Button onClick={handleSaveLearn}>Save & Resolve</Button> {/* Now real */}
+            </DialogFooter>
+          </DialogContent>
+        </Dialog>
 
       </div>
     </div>

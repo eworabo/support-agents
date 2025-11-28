@@ -227,12 +227,12 @@ async def escalate_endpoint(ticket: TicketInput):
 @app.get("/metrics")
 async def get_metrics(db: AsyncSession = Depends(get_db)):
     try:
-        total_tickets = (await db.execute(select(func.count(Ticket.id)))).scalar_one_or_none() or 0
-        resolved = (await db.execute(select(func.count(Ticket.id)).where(Ticket.status == 'resolved'))).scalar_one_or_none() or 0
-        escalated = (await db.execute(select(func.count(Ticket.id)).where(Ticket.status == 'escalated'))).scalar_one_or_none() or 0
-
+        resolved = (await db.execute(select(func.count(Ticket.id)).where(Ticket.status.in_(['auto_resolved', 'human_resolved'])))).scalar() or 0
+        escalated = (await db.execute(select(func.count(Ticket.id)).where(Ticket.status == 'escalated'))).scalar() or 0
+        total_tickets = resolved + escalated
         resolve_rate = round((resolved / total_tickets * 100), 1) if total_tickets > 0 else 0.0
         escalate_rate = round((escalated / total_tickets * 100), 1) if total_tickets > 0 else 0.0
+# Rest unchanged
 
         return {
             'resolveRate': resolve_rate,
@@ -315,21 +315,18 @@ async def save_kb_entry(
         logger.error(f"KB save error: {str(e)}")
         raise HTTPException(status_code=500, detail=f"Failed to save KB entry: {str(e)}")
 
-@app.delete("/kb/{id}")
-async def delete_kb_entry(id: int, db: AsyncSession = Depends(get_db)):
+@app.post("/tickets/{id}/resolve")
+async def resolve_human_ticket(id: int, db: AsyncSession = Depends(get_db)):
     try:
-        stmt = select(KBEntry).where(KBEntry.id == id)
+        stmt = select(Ticket).where(Ticket.id == id, Ticket.status == 'escalated')
         result = await db.execute(stmt)
-        entry = result.scalar_one_or_none()
-        
-        if not entry:
-            raise HTTPException(status_code=404, detail="KB entry not found")
-        
-        await db.delete(entry)
+        ticket = result.scalar_one_or_none()
+        if not ticket:
+            raise HTTPException(status_code=404, detail="Ticket not found or not escalated")
+        ticket.status = 'human_resolved'
         await db.commit()
-        
-        return {"message": "KB entry deleted successfully"}
+        return {"status": "human_resolved"}
     except Exception as e:
         await db.rollback()
-        logger.error(f"KB delete error: {str(e)}")
-        raise HTTPException(status_code=500, detail=f"Failed to delete KB entry: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Failed to resolve ticket: {str(e)}")
+
