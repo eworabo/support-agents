@@ -21,4 +21,4 @@ class KBEntry(Base):
     id: Mapped[int] = Column(Integer, primary_key=True)
     title: Mapped[str] = Column(String(255), nullable=False)
     content: Mapped[str] = Column(Text, nullable=False)
-    file_url: Mapped[Optional[str]] = Column(String(255))  # URL to uploaded attachment
+    file_url: Mapped[Optional[str]] = Column(Text) 

@@ -1,3 +1,4 @@
+from typing import List  
 from aiohttp import ClientSession
 import os
 import sys
@@ -24,6 +25,7 @@ from tools import search_kb
 from sqlalchemy import select, func
 from sqlalchemy.ext.asyncio import create_async_engine, async_sessionmaker, AsyncSession
 import logging
+from fastapi.staticfiles import StaticFiles
  # Import from your new models.py in backend/
 # Imports now work – classifier.py is in backend folder, so relative path is fine
 from classifier import classify_ticket
@@ -144,11 +146,15 @@ escalate_task = Task(
 app = FastAPI(title="Support Swarm Backend")
 app.add_middleware(
   CORSMiddleware,
-  allow_origins=["http://localhost:3000", "*"],  # Or specific frontend URL; "*" for dev
+  allow_origins=["http://localhost:3000", "*"],  
   allow_credentials=True,
   allow_methods=["*"],
   allow_headers=["*"],
 )
+
+# ADD THESE 3 LINES HERE (after line 163)
+os.makedirs("uploads", exist_ok=True)  
+app.mount("/uploads", StaticFiles(directory="uploads"), name="uploads")
 
 @app.post("/classify", response_model=ClassificationResponse)
 async def classify_endpoint(ticket: TicketInput):
@@ -278,28 +284,30 @@ async def get_kb_list(page: int = Query(1, ge=1), size: int = Query(10, ge=1, le
         logger.error(f"KB list error: {str(e)}")
         raise HTTPException(status_code=500, detail="Failed to fetch KB entries")
 
+
 @app.post("/kb")
-async def save_kb_entry(title: str = Form(...), content: str = Form(...), file: UploadFile = File(None), db: AsyncSession = Depends(get_db)):
+async def save_kb_entry(
+    title: str = Form(...), 
+    content: str = Form(...), 
+    files: List[UploadFile] = File(None),  # Changed from file to files (List)
+    db: AsyncSession = Depends(get_db)
+):
     try:
-        file_url = None
-        if file:
-            # Create uploads directory if it doesn't exist
+        file_urls = []
+        if files:
             os.makedirs("uploads", exist_ok=True)
-            file_path = f"uploads/{file.filename}"
-            with open(file_path, "wb") as f:
-                f.write(await file.read())
-            file_url = f"http://localhost:8000/{file_path}"
+            for file in files:
+                file_path = f"uploads/{file.filename}"
+                with open(file_path, "wb") as f:
+                    f.write(await file.read())
+                file_urls.append(f"http://localhost:8000/{file_path}")
+
+        file_url_str = ",".join(file_urls) if file_urls else None
         
-        new_entry = KBEntry(title=title, content=content, file_url=file_url)
+        new_entry = KBEntry(title=title, content=content, file_url=file_url_str)
         db.add(new_entry)
         await db.commit()
         await db.refresh(new_entry)
-        
-        # Skip rebuild for now since endpoint doesn't exist
-        # async with ClientSession() as session:
-        #     async with session.post("http://localhost:8000/api/rebuild-vectordb") as res:
-        #         if res.status != 200:
-        #             raise Exception("Rebuild failed")  # Changed from Error to Exception
         
         return new_entry
     except Exception as e:

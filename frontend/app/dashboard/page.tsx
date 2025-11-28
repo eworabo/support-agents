@@ -50,8 +50,8 @@ export default function Dashboard() {
   const [kbEntries, setKBEntries] = useState<KBEntry[]>([]);
   const [newTitle, setNewTitle] = useState('');
   const [newContent, setNewContent] = useState('');
-  const [newFile, setNewFile] = useState<File | null>(null);  
-
+  const [newFiles, setNewFiles] = useState<File[]>([]);
+  
   const DraggableEntry = ({ entry, index, moveEntry }) => {
     const [, drop] = useDrop({
       accept: 'entry',
@@ -75,16 +75,24 @@ export default function Dashboard() {
       <div ref={(node) => drag(drop(node))} className={`p-4 border rounded ${isDragging ? 'opacity-50' : ''}`}>
         <h3 className="font-bold">{entry.title}</h3>
         <p className="text-sm text-muted-foreground">{entry.content}</p>
-        {entry.file_url && (
-          <a 
-            href={entry.file_url} 
-            target="_blank" 
-            rel="noopener noreferrer" 
-            className="text-blue-500 hover:underline text-sm mt-2 inline-block"
-          >
-            📎 View Attachment
-          </a>
-        )}
+        
+        {/* FIX: Split the URLs by comma and render a link for each one */}
+        {entry.file_url && entry.file_url.split(',').map((url, i) => {
+          // Optional: Extract a clean filename for display (e.g., "manual.pdf")
+          const fileName = decodeURIComponent(url.split('/').pop() || `Attachment ${i + 1}`);
+          
+          return (
+            <a 
+              key={i}
+              href={url.trim()} 
+              target="_blank" 
+              rel="noopener noreferrer" 
+              className="text-blue-500 hover:underline text-sm mt-2 block" 
+            >
+              📎 {fileName}
+            </a>
+          );
+        })}
       </div>
     );
   };
@@ -126,13 +134,17 @@ export default function Dashboard() {
   };
 
   const fetchKBEntries = async () => {
+    console.log("🔄 Fetching KB entries...");
     try {
       const backendUrl = process.env.NEXT_PUBLIC_BACKEND_URL || "http://localhost:8000";
-      const res = await fetch(`${backendUrl}/kb`);
+      const res = await fetch(`${backendUrl}/kb?size=50`);  // ← ADD ?size=50
       if (!res.ok) throw new Error("Failed to fetch KB entries");
       const data = await res.json();
-      setKBEntries(data.items || []);  // Real entries or fallback empty
+      console.log("📚 KB Data received:", data);
+      console.log("📚 Number of entries:", data.items?.length || 0);
+      setKBEntries(data.items || []);
     } catch (e) {
+      console.error("❌ Fetch KB error:", e);
       setError("Failed to fetch KB entries—check backend.");
       setKBEntries([]);
     }
@@ -147,25 +159,49 @@ export default function Dashboard() {
   };
 
   const saveKBEntry = async () => {
+    console.log("🔵 Save button clicked!");
+    console.log("📝 Title:", newTitle);
+    console.log("📝 Content:", newContent);
+    console.log("📎 Files:", newFiles);
+    
     try {
       const backendUrl = process.env.NEXT_PUBLIC_BACKEND_URL || "http://localhost:8000";
       const formData = new FormData();
       formData.append('title', newTitle);
       formData.append('content', newContent);
-      if (newFile) formData.append('file', newFile);
+      
+      newFiles.forEach(file => {
+        formData.append('files', file);
+      });
+      
+      console.log("🚀 Sending request to backend...");
+      
       const res = await fetch(`${backendUrl}/kb`, {
         method: 'POST',
         body: formData
       });
+      
+      console.log("✅ Response status:", res.status);
+      
       if (!res.ok) throw new Error("Failed to save KB");
+      
+      const data = await res.json();
+      console.log("✅ Save successful! Data:", data);
+      
+      alert("✅ KB entry saved successfully!");  // Temporary confirmation
+      
       setNewTitle('');
       setNewContent('');
-      setNewFile(null);
-      fetchKBEntries();  // Refresh
+      setNewFiles([]);
+      fetchKBEntries();
     } catch (e) {
+      console.error("❌ Save error:", e);
+      alert("❌ Failed to save: " + e.message);
       setError("Failed to save KB—check backend.");
     }
   };
+
+
 
   const fetchEscalatedTickets = async () => {
     try {
@@ -339,7 +375,37 @@ export default function Dashboard() {
                 </DndProvider>
                 <Input value={newTitle} onChange={(e) => setNewTitle(e.target.value)} placeholder="New Title" className="mt-4" />
                 <Textarea value={newContent} onChange={(e) => setNewContent(e.target.value)} placeholder="New Content" className="mt-2" />
-                <Input type="file" onChange={(e) => setNewFile(e.target.files?.[0] || null)} className="mt-2" />
+
+
+
+                {/* Show selected files */}
+                {newFiles.length > 0 && (
+                  <div className="mt-4 space-y-2">
+                    <p className="text-sm font-medium">Selected files ({newFiles.length}):</p>
+                    {newFiles.map((file, idx) => (
+                      <div key={idx} className="flex items-center justify-between bg-muted p-2 rounded">
+                        <span className="text-sm">📎 {file.name}</span>
+                        <Button 
+                          variant="ghost" 
+                          size="sm"
+                          onClick={() => setNewFiles(prev => prev.filter((_, i) => i !== idx))}
+                        >
+                          Remove
+                        </Button>
+                      </div>
+                    ))}
+                  </div>
+                )}
+                <Input 
+                  type="file" 
+                  multiple
+                  onChange={(e) => {
+                    const selectedFiles = Array.from(e.target.files || []);
+                    setNewFiles(prev => [...prev, ...selectedFiles]);  // Accumulate files
+                    e.target.value = '';  // Reset input
+                  }} 
+                  className="mt-2" 
+                />
                 <Button onClick={saveKBEntry} className="mt-4">Save and Rebuild Vector DB</Button>    
               </CardContent>
             </Card>
