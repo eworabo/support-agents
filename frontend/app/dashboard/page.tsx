@@ -13,6 +13,9 @@ import Link from "next/link";
 import { ArrowUpRight, Trash2 } from "lucide-react";
 import { DndProvider, useDrag, useDrop } from 'react-dnd';
 import { HTML5Backend } from 'react-dnd-html5-backend';
+import { TouchBackend } from 'react-dnd-touch-backend';  // For mobile
+import { Input } from "@/components/ui/input";
+import { Textarea } from "@/components/ui/textarea";  // Separate import for Textarea
 
 interface Metrics {
   resolveRate: number;
@@ -36,6 +39,7 @@ interface KBEntry {
   id: number;
   title: string;
   content: string;
+  file_url?: string;  // ADD THIS LINE
 }
 
 export default function Dashboard() {
@@ -44,7 +48,46 @@ export default function Dashboard() {
   const [error, setError] = useState<string | null>(null);
   const [escalatedTickets, setEscalatedTickets] = useState<Ticket[]>([]);
   const [kbEntries, setKBEntries] = useState<KBEntry[]>([]);
+  const [newTitle, setNewTitle] = useState('');
+  const [newContent, setNewContent] = useState('');
+  const [newFile, setNewFile] = useState<File | null>(null);  
 
+  const DraggableEntry = ({ entry, index, moveEntry }) => {
+    const [, drop] = useDrop({
+      accept: 'entry',
+      hover: (item: { index: number }) => {
+        if (item.index !== index) {
+          moveEntry(item.index, index);
+          item.index = index;
+        }
+      },
+    });
+  
+    const [{ isDragging }, drag] = useDrag({
+      type: 'entry',
+      item: { index },
+      collect: (monitor) => ({
+        isDragging: monitor.isDragging(),
+      }),
+    });
+  
+    return (
+      <div ref={(node) => drag(drop(node))} className={`p-4 border rounded ${isDragging ? 'opacity-50' : ''}`}>
+        <h3 className="font-bold">{entry.title}</h3>
+        <p className="text-sm text-muted-foreground">{entry.content}</p>
+        {entry.file_url && (
+          <a 
+            href={entry.file_url} 
+            target="_blank" 
+            rel="noopener noreferrer" 
+            className="text-blue-500 hover:underline text-sm mt-2 inline-block"
+          >
+            📎 View Attachment
+          </a>
+        )}
+      </div>
+    );
+  };
   
 
   const fetchMetrics = async () => {
@@ -82,19 +125,6 @@ export default function Dashboard() {
     }
   };
 
-  const fetchEscalatedTickets = async () => {
-    try {
-      const backendUrl = process.env.NEXT_PUBLIC_BACKEND_URL || "http://localhost:8000";
-      const res = await fetch(`${backendUrl}/escalate`);
-      if (!res.ok) throw new Error("Failed to fetch escalated tickets");
-      const data = await res.json();
-      setEscalatedTickets(data.items || []);  // Real tickets or fallback empty array
-    } catch (e) {
-      setError("Failed to fetch escalated tickets—check backend.");
-      setEscalatedTickets([]);  // Fallback empty on error
-    }
-  };
-
   const fetchKBEntries = async () => {
     try {
       const backendUrl = process.env.NEXT_PUBLIC_BACKEND_URL || "http://localhost:8000";
@@ -108,20 +138,47 @@ export default function Dashboard() {
     }
   };
 
-  const saveKB = async () => {
+  const moveEntry = (dragIndex: number, hoverIndex: number) => {
+    const newEntries = [...kbEntries];
+    const [dragged] = newEntries.splice(dragIndex, 1);
+    newEntries.splice(hoverIndex, 0, dragged);
+    setKBEntries(newEntries);
+    // Save reordered to backend if needed (add POST /kb/reorder endpoint later)
+  };
+
+  const saveKBEntry = async () => {
     try {
       const backendUrl = process.env.NEXT_PUBLIC_BACKEND_URL || "http://localhost:8000";
+      const formData = new FormData();
+      formData.append('title', newTitle);
+      formData.append('content', newContent);
+      if (newFile) formData.append('file', newFile);
       const res = await fetch(`${backendUrl}/kb`, {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ title: 'New Title', content: 'New Content' })  // Replace with form input
+        body: formData
       });
       if (!res.ok) throw new Error("Failed to save KB");
-      fetchKBEntries();  // Refresh list
+      setNewTitle('');
+      setNewContent('');
+      setNewFile(null);
+      fetchKBEntries();  // Refresh
     } catch (e) {
       setError("Failed to save KB—check backend.");
     }
-  };    
+  };
+
+  const fetchEscalatedTickets = async () => {
+    try {
+      const backendUrl = process.env.NEXT_PUBLIC_BACKEND_URL || "http://localhost:8000";
+      const res = await fetch(`${backendUrl}/escalate`);
+      if (!res.ok) throw new Error("Failed to fetch escalated tickets");
+      const data = await res.json();
+      setEscalatedTickets(data.items || []);
+    } catch (e) {
+      setError("Failed to fetch escalated tickets—check backend.");
+      setEscalatedTickets([]);
+    }
+  };
 
   useEffect(() => {
     fetchMetrics();
@@ -266,17 +323,24 @@ export default function Dashboard() {
 
           <TabsContent value="kb">
             <Card>
-              <CardHeader><CardTitle>Knowledge Base Editor</CardTitle></CardHeader>
+            <CardHeader className="flex flex-row items-center justify-between">
+              <CardTitle>Knowledge Base Editor</CardTitle>
+              <Button variant="outline" size="sm" onClick={fetchKBEntries}>
+                Refresh
+              </Button>
+            </CardHeader>
               <CardContent>
-                <div className="space-y-4">
-                  {kbEntries.map((entry, index) => (
-                    <div key={entry.id} className="p-4 border rounded">
-                      <h3>{entry.title}</h3>
-                      <p>{entry.content}</p>
-                    </div>
-                  ))}
-                </div>
-                <Button onClick={saveKB}>Save and Rebuild Vector DB</Button>
+                <DndProvider backend={HTML5Backend}>
+                  <div className="space-y-4">
+                    {kbEntries.map((entry, index) => (
+                      <DraggableEntry key={entry.id} entry={entry} index={index} moveEntry={moveEntry} />
+                    ))}
+                  </div>
+                </DndProvider>
+                <Input value={newTitle} onChange={(e) => setNewTitle(e.target.value)} placeholder="New Title" className="mt-4" />
+                <Textarea value={newContent} onChange={(e) => setNewContent(e.target.value)} placeholder="New Content" className="mt-2" />
+                <Input type="file" onChange={(e) => setNewFile(e.target.files?.[0] || null)} className="mt-2" />
+                <Button onClick={saveKBEntry} className="mt-4">Save and Rebuild Vector DB</Button>    
               </CardContent>
             </Card>
           </TabsContent>

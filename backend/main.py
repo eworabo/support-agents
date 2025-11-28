@@ -1,3 +1,4 @@
+from aiohttp import ClientSession
 import os
 import sys
 
@@ -11,8 +12,9 @@ from fastapi.middleware.cors import CORSMiddleware
 # Force dotenv from project root – fixes subprocess working dir quirk
 load_dotenv(dotenv_path=os.path.join(project_root, '.env'))
 
+
 from openai import OpenAI
-from fastapi import FastAPI, HTTPException, Depends, Query
+from fastapi import FastAPI, HTTPException, Depends, Query, File, Form, UploadFile
 from models import Ticket, KBEntry
 from pydantic import BaseModel, Field
 from typing import Optional, Literal
@@ -277,17 +279,27 @@ async def get_kb_list(page: int = Query(1, ge=1), size: int = Query(10, ge=1, le
         raise HTTPException(status_code=500, detail="Failed to fetch KB entries")
 
 @app.post("/kb")
-async def save_kb_entry(entry: KBEntryIn, db: AsyncSession = Depends(get_db)):
+async def save_kb_entry(title: str = Form(...), content: str = Form(...), file: UploadFile = File(None), db: AsyncSession = Depends(get_db)):
     try:
-        new_entry = KBEntry(title=entry.title, content=entry.content)
+        file_url = None
+        if file:
+            # Create uploads directory if it doesn't exist
+            os.makedirs("uploads", exist_ok=True)
+            file_path = f"uploads/{file.filename}"
+            with open(file_path, "wb") as f:
+                f.write(await file.read())
+            file_url = f"http://localhost:8000/{file_path}"
+        
+        new_entry = KBEntry(title=title, content=content, file_url=file_url)
         db.add(new_entry)
         await db.commit()
         await db.refresh(new_entry)
         
-        # Optional: Rebuild vector DB if you have that endpoint
-        # import httpx
-        # async with httpx.AsyncClient() as client:
-        #     await client.post("http://127.0.0.1:8000/api/rebuild-vectordb")
+        # Skip rebuild for now since endpoint doesn't exist
+        # async with ClientSession() as session:
+        #     async with session.post("http://localhost:8000/api/rebuild-vectordb") as res:
+        #         if res.status != 200:
+        #             raise Exception("Rebuild failed")  # Changed from Error to Exception
         
         return new_entry
     except Exception as e:
