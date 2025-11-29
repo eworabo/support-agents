@@ -26,10 +26,10 @@ from sqlalchemy import select, func
 from sqlalchemy.ext.asyncio import create_async_engine, async_sessionmaker, AsyncSession
 import logging
 from fastapi.staticfiles import StaticFiles
- # Import from your new models.py in backend/
-# Imports now work – classifier.py is in backend folder, so relative path is fine
 from classifier import classify_ticket
-# from tools import search_kb  # Temporarily disabled while fixing tool format
+from langchain_openai import OpenAIEmbeddings   
+#from langchain.vectorstores.faiss import FAISS 
+from langchain_community.vectorstores import FAISS
 
 client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 # Async DB setup for scalable queries
@@ -140,6 +140,20 @@ escalate_task = Task(
     expected_output="JSON matching EscalateOutput",
     output_pydantic=EscalateOutput
 )
+
+vectorstore = None
+
+async def rebuild_vectorstore(db: AsyncSession):
+    global vectorstore
+    try:
+        results = await db.execute(select(KBEntry))
+        entries = results.scalars().all()
+        embeddings = OpenAIEmbeddings()
+        texts = [f"{entry.title}: {entry.content}" for entry in entries]
+        vectorstore = FAISS.from_texts(texts, embeddings)
+        logger.info("Vectorstore rebuilt")
+    except Exception as e:
+        logger.error(f"Rebuild failed: {str(e)}")
 
 # ================================== FASTAPI APP ==================================
 
@@ -308,12 +322,14 @@ async def save_kb_entry(
         db.add(new_entry)
         await db.commit()
         await db.refresh(new_entry)
-        
+        await rebuild_vectorstore(db)
         return new_entry
     except Exception as e:
         await db.rollback()
         logger.error(f"KB save error: {str(e)}")
         raise HTTPException(status_code=500, detail=f"Failed to save KB entry: {str(e)}")
+
+
 
 @app.post("/tickets/{id}/resolve")
 async def resolve_human_ticket(id: int, db: AsyncSession = Depends(get_db)):
