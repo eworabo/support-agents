@@ -454,48 +454,80 @@ export default function Dashboard() {
 
           <TabsContent value="kb">
             <Card>
+              <CardHeader>
+                <CardTitle>Knowledge Base Editor</CardTitle>
+              </CardHeader>
               <CardContent>
-                <DndProvider backend={HTML5Backend}>
-                  <div className="space-y-4">
-                    {kbEntries.map((entry, index) => (
-                      <DraggableEntry key={entry.id} entry={entry} index={index} moveEntry={moveEntry} deleteKBEntry={deleteKBEntry} />
-                    ))}
-                  </div>
-                </DndProvider>
-                <Input value={newTitle} onChange={(e) => setNewTitle(e.target.value)} placeholder="New Title" className="mt-4" />
-                <Textarea value={newContent} onChange={(e) => setNewContent(e.target.value)} placeholder="New Content" className="mt-2" />
+                {/* ADD NEW ENTRY FORM - MOVED TO TOP */}
+                <div className="mb-8 p-4 border rounded-lg bg-muted/30">
+                  <h3 className="font-semibold mb-4">Add New Entry</h3>
+                  <Input 
+                    value={newTitle} 
+                    onChange={(e) => setNewTitle(e.target.value)} 
+                    placeholder="Title (e.g., 'Refund Policy')" 
+                    className="mb-2" 
+                  />
+                  <Textarea 
+                    value={newContent} 
+                    onChange={(e) => setNewContent(e.target.value)} 
+                    placeholder="Content (e.g., 'Customers can request refunds within 30 days...')" 
+                    className="mb-2" 
+                    rows={4}
+                  />
+                  
+                  {/* Show selected files */}
+                  {newFiles.length > 0 && (
+                    <div className="mb-4 space-y-2">
+                      <p className="text-sm font-medium">Selected files ({newFiles.length}):</p>
+                      {newFiles.map((file, idx) => (
+                        <div key={idx} className="flex items-center justify-between bg-background p-2 rounded">
+                          <span className="text-sm">📎 {file.name}</span>
+                          <Button 
+                            variant="ghost" 
+                            size="sm"
+                            onClick={() => setNewFiles(prev => prev.filter((_, i) => i !== idx))}
+                          >
+                            Remove
+                          </Button>
+                        </div>
+                      ))}
+                    </div>
+                  )}
+                  
+                  <Input 
+                    type="file" 
+                    multiple
+                    onChange={(e) => {
+                      const selectedFiles = Array.from(e.target.files || []);
+                      setNewFiles(prev => [...prev, ...selectedFiles]);
+                      e.target.value = '';
+                    }} 
+                    className="mb-4" 
+                  />
+                  <Button onClick={saveKBEntry}>Save and Rebuild Vector DB</Button>
+                </div>
 
-
-
-                {/* Show selected files */}
-                {newFiles.length > 0 && (
-                  <div className="mt-4 space-y-2">
-                    <p className="text-sm font-medium">Selected files ({newFiles.length}):</p>
-                    {newFiles.map((file, idx) => (
-                      <div key={idx} className="flex items-center justify-between bg-muted p-2 rounded">
-                        <span className="text-sm">📎 {file.name}</span>
-                        <Button 
-                          variant="ghost" 
-                          size="sm"
-                          onClick={() => setNewFiles(prev => prev.filter((_, i) => i !== idx))}
-                        >
-                          Remove
-                        </Button>
-                      </div>
-                    ))}
-                  </div>
-                )}
-                <Input 
-                  type="file" 
-                  multiple
-                  onChange={(e) => {
-                    const selectedFiles = Array.from(e.target.files || []);
-                    setNewFiles(prev => [...prev, ...selectedFiles]);  // Accumulate files
-                    e.target.value = '';  // Reset input
-                  }} 
-                  className="mt-2" 
-                />
-                <Button onClick={() => saveKBEntry(newTitle, newContent, newFiles)} className="mt-4">Save and Rebuild Vector DB</Button>   
+                {/* EXISTING ENTRIES - NOW BELOW */}
+                <div>
+                  <h3 className="font-semibold mb-4">Existing Entries ({kbEntries.length})</h3>
+                  <DndProvider backend={HTML5Backend}>
+                    <div className="space-y-4">
+                      {kbEntries.length === 0 ? (
+                        <p className="text-muted-foreground text-center py-8">No entries yet. Add one above!</p>
+                      ) : (
+                        kbEntries.map((entry, index) => (
+                          <DraggableEntry 
+                            key={entry.id} 
+                            entry={entry} 
+                            index={index} 
+                            moveEntry={moveEntry}
+                            deleteKBEntry={deleteKBEntry}
+                          />
+                        ))
+                      )}
+                    </div>
+                  </DndProvider>
+                </div>
               </CardContent>
             </Card>
           </TabsContent>
