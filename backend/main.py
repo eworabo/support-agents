@@ -15,7 +15,7 @@ load_dotenv(dotenv_path=os.path.join(project_root, '.env'))
 
 
 from openai import OpenAI
-from fastapi import FastAPI, HTTPException, Depends, Query, File, Form, UploadFile
+from fastapi import FastAPI, HTTPException, Depends, Query, File, Form, UploadFile, Request, Header
 from models import Ticket, KBEntry
 from pydantic import BaseModel, Field
 from typing import Optional, Literal
@@ -27,9 +27,11 @@ from sqlalchemy.ext.asyncio import create_async_engine, async_sessionmaker, Asyn
 import logging
 from fastapi.staticfiles import StaticFiles
 from classifier import classify_ticket
-from langchain_openai import OpenAIEmbeddings   
-#from langchain.vectorstores.faiss import FAISS 
+from langchain_openai import OpenAIEmbeddings
 from langchain_community.vectorstores import FAISS
+from sendgrid import SendGridAPIClient
+from sendgrid.helpers.mail import Mail
+import resend
 
 client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 # Async DB setup for scalable queries
@@ -346,3 +348,23 @@ async def resolve_human_ticket(id: int, db: AsyncSession = Depends(get_db)):
         await db.rollback()
         raise HTTPException(status_code=500, detail=f"Failed to resolve ticket: {str(e)}")
 
+@app.post("/inbound_email")
+async def inbound_email(request: Request):
+    try:
+        payload = await request.json()  # SendGrid sends JSON with 'subject', 'text', 'from', etc.
+        ticket_text = f"From: {payload.get('from')} Subject: {payload.get('subject')} Body: {payload.get('text')}"
+        ticket = TicketInput(text=ticket_text)
+        response = await resolve_endpoint(ticket)  # Call your existing resolve
+        # Later: Outbound reply if resolved
+        return {"status": "processed"}
+    except Exception as e:
+        logger.error(f"Email process error: {str(e)}")
+        raise HTTPException(status_code=500, detail="Failed to process email")
+
+from fastapi import Header  # Add to imports for API key
+
+@app.post("/resolve", response_model=ResolveResponse)
+async def resolve_endpoint(ticket: TicketInput, api_key: str = Header(None), db: AsyncSession = Depends(get_db)):
+    if api_key != os.getenv("API_KEY"):  # Stub auth—set in .env
+        raise HTTPException(status_code=401, detail="Invalid API key")
+    # Existing resolve code...
