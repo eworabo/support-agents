@@ -8,11 +8,13 @@ project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
 sys.path.insert(0, project_root)
 sys.path.insert(0, os.path.dirname(__file__))  # Backend folder itself
 
+from celery import Celery 
 from dotenv import load_dotenv
 from fastapi.middleware.cors import CORSMiddleware
-# Force dotenv from project root – fixes subprocess working dir quirk
-load_dotenv(dotenv_path=os.path.join(project_root, '.env'))
 
+load_dotenv(dotenv_path=os.path.join(project_root, '.env'))
+app_celery = Celery('support_swarm', broker=os.getenv('REDIS_URL'), backend=os.getenv('REDIS_URL'))
+print(app_celery)
 
 from openai import OpenAI
 from fastapi import FastAPI, HTTPException, Depends, Query, File, Form, UploadFile, Request, Header
@@ -22,7 +24,7 @@ from typing import Optional, Literal
 from crewai import Agent, Task, Crew, Process
 from langchain_openai import ChatOpenAI
 from tools import search_kb
-from sqlalchemy import select, func
+from sqlalchemy import select, func, text
 from sqlalchemy.ext.asyncio import create_async_engine, async_sessionmaker, AsyncSession
 import logging
 from fastapi.staticfiles import StaticFiles
@@ -32,6 +34,51 @@ from langchain_community.vectorstores import FAISS
 from sendgrid import SendGridAPIClient
 from sendgrid.helpers.mail import Mail
 import resend
+from supabase import create_client, Client
+from kb_vectorstore import embed_kb_entry
+
+
+@app_celery.task
+def run_resolve_task(ticket_text: str, tag: str, class_conf: float):
+    # Rebuild everything fresh – no globals choking us
+    from crewai import Agent, Task, Crew, Process
+    from langchain_openai import ChatOpenAI
+    from tools import search_kb  # Your KB tool
+    llm = ChatOpenAI(model="gpt-4o-mini", temperature=0.0)
+
+    resolver_agent = Agent(
+        role="Senior Ticket Resolver",
+        goal="Resolve only when KB match ≥0.82. Never guess or hallucinate.",
+        backstory="10+ years in support, knows every edge case of our product.",
+        tools=[search_kb],
+        llm=llm,
+        allow_delegation=False,
+        verbose=True
+    )
+
+    resolve_task = Task(
+        description="""
+        1. Use search_kb tool (multiple calls allowed).
+        2. Only if highest_confidence ≥ 0.82 craft polite, complete reply.
+        3. Otherwise resolved=false.
+        Ticket: {ticket_text}
+        Tag: {tag} (class confidence {class_conf:.2f})
+        """,
+        agent=resolver_agent,
+        expected_output="JSON matching ResolveOutput",
+        output_pydantic=ResolveOutput
+    )
+
+    crew = Crew(agents=[resolver_agent], tasks=[resolve_task], process=Process.sequential, verbose=True)
+    crew_output = crew.kickoff(inputs={"ticket_text": ticket_text, "tag": tag, "class_conf": class_conf})
+    return crew_output.pydantic  # Ready for polling
+ # Import the new function
+
+supabase: Client = create_client(os.getenv("SUPABASE_URL"), os.getenv("SUPABASE_KEY"))
+# Quick test: print(supabase.table('kb_entries').select('count(*)').execute())  # Comment out after
+SUPABASE_URL = os.getenv('SUPABASE_URL')
+SUPABASE_KEY = os.getenv('SUPABASE_KEY')
+supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
 
 client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 # Async DB setup for scalable queries
@@ -145,17 +192,11 @@ escalate_task = Task(
 
 vectorstore = None
 
-async def rebuild_vectorstore(db: AsyncSession):
-    global vectorstore
-    try:
-        results = await db.execute(select(KBEntry))
-        entries = results.scalars().all()
-        embeddings = OpenAIEmbeddings()
-        texts = [f"{entry.title}: {entry.content}" for entry in entries]
-        vectorstore = FAISS.from_texts(texts, embeddings)
-        logger.info("Vectorstore rebuilt")
-    except Exception as e:
-        logger.error(f"Rebuild failed: {str(e)}")
+def rebuild_vectorstore():
+    res = supabase.table('kb_entries').select('id, title, content').execute()
+    for entry in res.data:
+        embed_kb_entry(entry['id'], entry['title'], entry['content'])
+    print("KB vectors rebuilt incrementally!")
 
 # ================================== FASTAPI APP ==================================
 
@@ -181,47 +222,14 @@ async def classify_endpoint(ticket: TicketInput):
         raise HTTPException(status_code=500, detail=f"Classification failed: {str(e)}")
 
 @app.post("/resolve", response_model=ResolveResponse)
-async def resolve_endpoint(ticket: TicketInput):
-    try:
-        classification = classify_ticket(ticket.text)
-        
-        crew = Crew(agents=[resolver_agent], tasks=[resolve_task], process=Process.sequential, verbose=True)
-        
-        crew_output = crew.kickoff(inputs={
-            "ticket_text": ticket.text,
-            "tag": classification["tag"],
-            "class_conf": classification["confidence"]
-        })
+async def resolve_endpoint(ticket: TicketInput, api_key: str = Header(None), db: AsyncSession = Depends(get_db)):
+    if api_key != os.getenv("API_KEY"):
+        raise HTTPException(status_code=401, detail="Invalid API key")
+    
+    classification = classify_ticket(ticket.text)
+    task = run_resolve_task.delay(ticket.text, classification["tag"], classification["confidence"])
+    return {"task_id": task.id, "message": "Resolution queued – poll /status/{task_id} for results"}
 
-        # Access the pydantic output
-        result = crew_output.pydantic
-
-        if result.resolved:
-            return ResolveResponse(
-                status="resolved",
-                reply=result.reply,
-                confidence=result.confidence,
-                tag=classification["tag"]
-            )
-        
-        # Auto-escalate
-# Auto-escalate
-        esc_crew = Crew(agents=[escalator_agent], tasks=[escalate_task], process=Process.sequential, verbose=True)
-        esc_output = esc_crew.kickoff(inputs={
-            "ticket_text": ticket.text,
-            "tag": classification["tag"]
-        })
-        esc_result = esc_output.pydantic  # ← Add this line
-
-        return ResolveResponse(
-            status="escalated",
-            summary=esc_result.summary,
-            suggested_department=esc_result.suggested_department,
-            priority=esc_result.priority,
-            tag=classification["tag"]
-        )
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Resolution failed: {str(e)}")
 
 @app.post("/escalate")
 async def escalate_endpoint(ticket: TicketInput):
@@ -288,49 +296,44 @@ async def get_escalate_detail(id: int, db: AsyncSession = Depends(get_db)):
         raise HTTPException(status_code=500, detail="Failed to fetch ticket detail")
 
 @app.get("/kb")
-async def get_kb_list(page: int = Query(1, ge=1), size: int = Query(10, ge=1, le=100), db: AsyncSession = Depends(get_db)):
+async def get_kb_list(page: int = Query(1, ge=1), size: int = Query(10, ge=1, le=100)):
     try:
-        stmt = select(KBEntry).offset((page - 1) * size).limit(size)
-        results = await db.execute(stmt)
-        entries = results.scalars().all()
-        total_stmt = select(func.count(KBEntry.id))
-        total = (await db.execute(total_stmt)).scalar() or 0
+        res = supabase.table('kb_entries').select('*').range((page - 1) * size, page * size - 1).execute()
+        entries = res.data
+        total_res = supabase.table('kb_entries').select('count(*)').execute()
+        total = total_res.data[0]['count'] if total_res.data else 0
         return {"items": entries, "total": total, "page": page, "size": size, "pages": (total + size - 1) // size}
-    except Exception as e:
+    except Exception as e:  # ← Dedented to match try
         logger.error(f"KB list error: {str(e)}")
         raise HTTPException(status_code=500, detail="Failed to fetch KB entries")
 
-
 @app.post("/kb")
-async def save_kb_entry(
-    title: str = Form(...), 
-    content: str = Form(...), 
-    files: List[UploadFile] = File(None),  # Changed from file to files (List)
-    db: AsyncSession = Depends(get_db)
-):
+async def save_kb_entry(title: str = Form(...), content: str = Form(...), files: List[UploadFile] = File(None)):
     try:
         file_urls = []
         if files:
-            os.makedirs("uploads", exist_ok=True)
             for file in files:
-                file_path = f"uploads/{file.filename}"
-                with open(file_path, "wb") as f:
-                    f.write(await file.read())
-                file_urls.append(f"http://localhost:8000/{file_path}")
+                file_content = await file.read()
+                upload_res = supabase.storage.from_('kb_uploads').upload(file.filename, file_content, {'content-type': file.content_type})
+                if upload_res:
+                    url = supabase.storage.from_('kb_uploads').get_public_url(file.filename)
+                    file_urls.append(url)
 
         file_url_str = ",".join(file_urls) if file_urls else None
         
-        new_entry = KBEntry(title=title, content=content, file_url=file_url_str)
-        db.add(new_entry)
-        await db.commit()
-        await db.refresh(new_entry)
-        await rebuild_vectorstore(db)
+        data = {'title': title, 'content': content, 'file_url': file_url_str}
+        insert_res = supabase.table('kb_entries').insert(data).execute()
+        if not insert_res.data:
+            raise ValueError("Insert failed")
+        new_entry = insert_res.data[0]
+        entry_id = new_entry['id']
+        
+        embed_kb_entry(entry_id, title, content)
+        
         return new_entry
     except Exception as e:
-        await db.rollback()
         logger.error(f"KB save error: {str(e)}")
-        raise HTTPException(status_code=500, detail=f"Failed to save KB entry: {str(e)}")
-
+        raise HTTPException(status_code=500, detail=f"Failed to save KB entry: {str(e)}") 
 
 
 @app.post("/tickets/{id}/resolve")
@@ -367,4 +370,24 @@ from fastapi import Header  # Add to imports for API key
 async def resolve_endpoint(ticket: TicketInput, api_key: str = Header(None), db: AsyncSession = Depends(get_db)):
     if api_key != os.getenv("API_KEY"):  # Stub auth—set in .env
         raise HTTPException(status_code=401, detail="Invalid API key")
-    # Existing resolve code...
+
+@app.get("/status/{task_id}")
+async def get_task_status(task_id: str):
+    from celery.result import AsyncResult
+    task = AsyncResult(task_id, app=app_celery)
+    if task.state == 'PENDING':
+        return {"status": "pending"}
+    elif task.state == 'SUCCESS':
+        result = task.result  # ResolveOutput
+        if result.resolved:
+            return {"status": "success", "result": ResolveResponse(
+                status="resolved",
+                reply=result.reply,
+                confidence=result.confidence,
+                tag="your_tag_here"  # Or from classification
+            )}
+        else:
+            # Escalate placeholder – add your esc_crew logic as another task if needed
+            return {"status": "escalated", "result": "Escalation details..."}
+    else:
+        return {"status": task.state, "info": str(task.info)}
