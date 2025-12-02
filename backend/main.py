@@ -11,8 +11,10 @@ sys.path.insert(0, os.path.dirname(__file__))  # Backend folder itself
 from celery import Celery 
 from dotenv import load_dotenv
 from fastapi.middleware.cors import CORSMiddleware
+import re 
 
 load_dotenv(dotenv_path=os.path.join(project_root, '.env'))
+print("REDIS_URL check: ", os.getenv('REDIS_URL'))
 app_celery = Celery('support_swarm', broker=os.getenv('REDIS_URL'), backend=os.getenv('REDIS_URL'))
 print(app_celery)
 
@@ -44,10 +46,11 @@ def run_resolve_task(ticket_text: str, tag: str, class_conf: float):
     from crewai import Agent, Task, Crew, Process
     from langchain_openai import ChatOpenAI
     from tools import search_kb  # Your KB tool
+    from pydantic import BaseModel, Field
     llm = ChatOpenAI(model="gpt-4o-mini", temperature=0.0)
 
     resolver_agent = Agent(
-        role="Senior Ticket Resolver",
+        role="Senior Ticket Resolver", 
         goal="Resolve only when KB match ≥0.82. Never guess or hallucinate.",
         backstory="10+ years in support, knows every edge case of our product.",
         tools=[search_kb],
@@ -71,8 +74,43 @@ def run_resolve_task(ticket_text: str, tag: str, class_conf: float):
 
     crew = Crew(agents=[resolver_agent], tasks=[resolve_task], process=Process.sequential, verbose=True)
     crew_output = crew.kickoff(inputs={"ticket_text": ticket_text, "tag": tag, "class_conf": class_conf})
-    return crew_output.pydantic  # Ready for polling
- # Import the new function
+
+    #FIX: Force to plain, serializable dict - no Pydantic residue
+    if hasattr(crew_output, 'pydantic') and crew_output.pydantic:
+        result = {
+            "resolved": crew_output.pydantic.resolved,
+            "reply": crew_output.pydantic.reply,
+            "confidence": crew_output.pydantic.confidence
+        }
+    else:
+        result = {
+            "resolved": False,
+            "reply": None,
+            "confidence": 0.0,
+            "error": "Failed to generate structured output"
+        }
+    
+    import json
+    return json.loads(json.dumps(result))  # Nukes any non-JSON junk
+    
+    # Make sure we never return a ResolveOutput object, only a dict
+    result_model = getattr(crew_output, "pydantic", None)
+    
+    if isinstance(result_model, BaseModel):
+        # Pydantic v2 uses model_dump, v1 uses dict
+        if hasattr(result_model, "model_dump"):
+            return result_model.model_dump()
+        else:
+            return result_model.dict()
+    else:
+        # Fallback if the LLM failed to generate valid JSON
+        return {
+            "resolved": False, 
+            "reply": None, 
+            "confidence": 0.0, 
+            "error": "Failed to generate structured output"
+        } 
+
 
 supabase: Client = create_client(os.getenv("SUPABASE_URL"), os.getenv("SUPABASE_KEY"))
 # Quick test: print(supabase.table('kb_entries').select('count(*)').execute())  # Comment out after
@@ -121,6 +159,13 @@ class ResolveResponse(BaseModel):
     confidence: Optional[float] = None
     suggested_department: Optional[str] = None
     priority: Optional[str] = None
+    tag: str
+
+# NEW: Response model for async task queuing
+class TaskQueueResponse(BaseModel):
+    task_id: str
+    message: str
+    status: Literal["queued", "pending"]
     tag: str
 
 class TicketOut(BaseModel):
@@ -221,14 +266,38 @@ async def classify_endpoint(ticket: TicketInput):
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Classification failed: {str(e)}")
 
-@app.post("/resolve", response_model=ResolveResponse)
-async def resolve_endpoint(ticket: TicketInput, api_key: str = Header(None), db: AsyncSession = Depends(get_db)):
+# FIXED: /resolve endpoint with correct response model
+@app.post("/resolve", response_model=TaskQueueResponse)
+async def resolve_endpoint(
+    ticket: TicketInput, 
+    api_key: str = Header(None), 
+    db: AsyncSession = Depends(get_db)
+):
+    """Queue ticket resolution as async Celery task"""
     if api_key != os.getenv("API_KEY"):
         raise HTTPException(status_code=401, detail="Invalid API key")
     
-    classification = classify_ticket(ticket.text)
-    task = run_resolve_task.delay(ticket.text, classification["tag"], classification["confidence"])
-    return {"task_id": task.id, "message": "Resolution queued – poll /status/{task_id} for results"}
+    try:
+        # Classify the ticket
+        classification = classify_ticket(ticket.text)
+        
+        # Queue the resolution task
+        task = run_resolve_task.delay(
+            ticket.text, 
+            classification["tag"], 
+            classification["confidence"]
+        )
+        
+        # Return properly formatted response
+        return TaskQueueResponse(
+            task_id=task.id,
+            message=f"Resolution queued – poll /status/{task.id} for results",
+            status="queued",
+            tag=classification["tag"]
+        )
+    except Exception as e:
+        logger.error(f"Resolve endpoint error: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Failed to queue resolution: {str(e)}")
 
 
 @app.post("/escalate")
@@ -311,12 +380,22 @@ async def get_kb_list(page: int = Query(1, ge=1), size: int = Query(10, ge=1, le
 async def save_kb_entry(title: str = Form(...), content: str = Form(...), files: List[UploadFile] = File(None)):
     try:
         file_urls = []
+        
         if files:
             for file in files:
                 file_content = await file.read()
-                upload_res = supabase.storage.from_('kb_uploads').upload(file.filename, file_content, {'content-type': file.content_type})
+                base_name, ext = os.path.splitext(file.filename)
+                safe_base_name = re.sub(r'[^\w\-.]', '_', base_name)
+                sanitized_filename = safe_base_name + ext
+                
+                upload_res = supabase.storage.from_('kb_uploads').upload(
+                    path=sanitized_filename,
+                    file=file_content,
+                    file_options={'content-type': file.content_type}
+                )
+                
                 if upload_res:
-                    url = supabase.storage.from_('kb_uploads').get_public_url(file.filename)
+                    url = supabase.storage.from_('kb_uploads').get_public_url(sanitized_filename)
                     file_urls.append(url)
 
         file_url_str = ",".join(file_urls) if file_urls else None
@@ -328,13 +407,17 @@ async def save_kb_entry(title: str = Form(...), content: str = Form(...), files:
         new_entry = insert_res.data[0]
         entry_id = new_entry['id']
         
-        embed_kb_entry(entry_id, title, content)
+        # Create embedding
+        embed_kb_entry(entry_id, title, content, file_url_str)
         
-        return new_entry
+        # Fetch the entry again to get the embedding
+        updated_entry = supabase.table('kb_entries').select('*').eq('id', entry_id).single().execute()
+        
+        return updated_entry.data if updated_entry.data else new_entry
+        
     except Exception as e:
         logger.error(f"KB save error: {str(e)}")
-        raise HTTPException(status_code=500, detail=f"Failed to save KB entry: {str(e)}") 
-
+        raise HTTPException(status_code=500, detail=f"Failed to save KB entry: {str(e)}")
 
 @app.post("/tickets/{id}/resolve")
 async def resolve_human_ticket(id: int, db: AsyncSession = Depends(get_db)):
@@ -352,42 +435,104 @@ async def resolve_human_ticket(id: int, db: AsyncSession = Depends(get_db)):
         raise HTTPException(status_code=500, detail=f"Failed to resolve ticket: {str(e)}")
 
 @app.post("/inbound_email")
-async def inbound_email(request: Request):
+async def inbound_email(request: Request, api_key: str = Header(None), db: AsyncSession = Depends(get_db)):
+    """Handle inbound emails from SendGrid or similar"""
     try:
+        if api_key != os.getenv("API_KEY"):
+            raise HTTPException(status_code=401, detail="Invalid API key")
+            
         payload = await request.json()  # SendGrid sends JSON with 'subject', 'text', 'from', etc.
         ticket_text = f"From: {payload.get('from')} Subject: {payload.get('subject')} Body: {payload.get('text')}"
         ticket = TicketInput(text=ticket_text)
-        response = await resolve_endpoint(ticket)  # Call your existing resolve
-        # Later: Outbound reply if resolved
-        return {"status": "processed"}
+        
+        # Call resolve endpoint to queue the task
+        response = await resolve_endpoint(ticket, api_key=api_key, db=db)
+        
+        return {"status": "processed", "task_id": response.task_id}
     except Exception as e:
         logger.error(f"Email process error: {str(e)}")
         raise HTTPException(status_code=500, detail="Failed to process email")
 
-from fastapi import Header  # Add to imports for API key
-
-@app.post("/resolve", response_model=ResolveResponse)
-async def resolve_endpoint(ticket: TicketInput, api_key: str = Header(None), db: AsyncSession = Depends(get_db)):
-    if api_key != os.getenv("API_KEY"):  # Stub auth—set in .env
-        raise HTTPException(status_code=401, detail="Invalid API key")
 
 @app.get("/status/{task_id}")
 async def get_task_status(task_id: str):
+    """Poll status of async Celery task"""
     from celery.result import AsyncResult
-    task = AsyncResult(task_id, app=app_celery)
-    if task.state == 'PENDING':
-        return {"status": "pending"}
-    elif task.state == 'SUCCESS':
-        result = task.result  # ResolveOutput
-        if result.resolved:
-            return {"status": "success", "result": ResolveResponse(
-                status="resolved",
-                reply=result.reply,
-                confidence=result.confidence,
-                tag="your_tag_here"  # Or from classification
-            )}
+    
+    try:
+        task = AsyncResult(task_id, app=app_celery)
+        
+        if task.state == 'PENDING':
+            return {"status": "pending", "message": "Task is queued or processing"}
+        
+        elif task.state == 'SUCCESS':
+            result = task.result  # This is a DICT now
+            
+            # FIX: Check if it's a dict and access keys safely
+            if isinstance(result, dict) and result.get('resolved'):
+                return {
+                    "status": "success",
+                    "result": {
+                        "status": "resolved",
+                        "reply": result.get('reply'),
+                        "confidence": result.get('confidence'),
+                        "tag": "resolution"
+                    }
+                }
+            else:
+                # Task completed but ticket needs escalation
+                confidence = result.get('confidence', 0.0) if isinstance(result, dict) else 0.0
+                return {
+                    "status": "needs_escalation",
+                    "result": {
+                        "confidence": confidence,
+                        "message": "Ticket requires human escalation"
+                    }
+                }
+        
+        elif task.state == 'FAILURE':
+            return {
+                "status": "failed",
+                "error": str(task.info)
+            }
+        
         else:
-            # Escalate placeholder – add your esc_crew logic as another task if needed
-            return {"status": "escalated", "result": "Escalation details..."}
-    else:
-        return {"status": task.state, "info": str(task.info)}
+            return {
+                "status": task.state.lower(),
+                "info": str(task.info) if task.info else None
+            }
+            
+    except Exception as e:
+        logger.error(f"Task status error: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Failed to get task status: {str(e)}")
+
+@app.delete("/kb/{entry_id}")
+async def delete_kb_entry(entry_id: int):
+    try:
+        # 1. Retrieve the entry to get the file URL(s)
+        entry_res = supabase.table('kb_entries').select('file_url').eq('id', entry_id).single().execute()
+        entry = entry_res.data
+        file_urls_str = entry.get('file_url')
+        
+        # 2. Delete the database entry
+        supabase.table('kb_entries').delete().eq('id', entry_id).execute()
+        
+        # 3. Delete the file(s) from Supabase Storage
+        if file_urls_str:
+            file_urls = [url.strip() for url in file_urls_str.split(',') if url.strip()]
+            
+            # Extract filenames from URLs (e.g., from '.../kb_uploads/filename.docx' to 'filename.docx')
+            filenames_to_delete = [url.split('/')[-1] for url in file_urls]
+            
+            if filenames_to_delete:
+                # Supabase storage remove expects a list of paths
+                supabase.storage.from_('kb_uploads').remove(filenames_to_delete)
+        
+        return {"status": "success", "message": f"KB entry {entry_id} and associated files deleted."}
+        
+    except Exception as e:
+        # If the entry was not found or deletion failed
+        if "No rows returned" in str(e):
+             raise HTTPException(status_code=404, detail=f"KB entry {entry_id} not found.")
+        logger.error(f"KB delete error: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Failed to delete KB entry: {str(e)}")
