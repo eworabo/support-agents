@@ -32,12 +32,12 @@ import logging
 from fastapi.staticfiles import StaticFiles
 from classifier import classify_ticket
 from langchain_openai import OpenAIEmbeddings
-from langchain_community.vectorstores import FAISS
 from sendgrid import SendGridAPIClient
 from sendgrid.helpers.mail import Mail
 import resend
 from supabase import create_client, Client
-from kb_vectorstore import embed_kb_entry
+from kb_vectorstore import embed_kb_entry, rebuild_all_embeddings
+import datetime
 
 
 @app_celery.task
@@ -235,14 +235,6 @@ escalate_task = Task(
     output_pydantic=EscalateOutput
 )
 
-vectorstore = None
-
-def rebuild_vectorstore():
-    res = supabase.table('kb_entries').select('id, title, content').execute()
-    for entry in res.data:
-        embed_kb_entry(entry['id'], entry['title'], entry['content'])
-    print("KB vectors rebuilt incrementally!")
-
 # ================================== FASTAPI APP ==================================
 
 app = FastAPI(title="Support Swarm Backend")
@@ -258,166 +250,211 @@ app.add_middleware(
 os.makedirs("uploads", exist_ok=True)  
 app.mount("/uploads", StaticFiles(directory="uploads"), name="uploads")
 
+# Startup event
+@app.on_event("startup")
+async def startup_event():
+    print("🚀 FastAPI app started successfully")
+
 @app.post("/classify", response_model=ClassificationResponse)
 async def classify_endpoint(ticket: TicketInput):
     try:
         result = classify_ticket(ticket.text)
         return ClassificationResponse(tag=result["tag"], confidence=result["confidence"])
     except Exception as e:
+        logger.error(f"Classification error: {str(e)}")
         raise HTTPException(status_code=500, detail=f"Classification failed: {str(e)}")
 
-# FIXED: /resolve endpoint with correct response model
 @app.post("/resolve", response_model=TaskQueueResponse)
 async def resolve_endpoint(
-    ticket: TicketInput, 
-    api_key: str = Header(None), 
+    ticket: TicketInput,
+    api_key: str = Header(None),
     db: AsyncSession = Depends(get_db)
 ):
-    """Queue ticket resolution as async Celery task"""
-    if api_key != os.getenv("API_KEY"):
-        raise HTTPException(status_code=401, detail="Invalid API key")
-    
+    """Queue ticket for async resolution"""
     try:
-        # Classify the ticket
+        if api_key != os.getenv("API_KEY"):
+            raise HTTPException(status_code=401, detail="Invalid API key")
+            
         classification = classify_ticket(ticket.text)
+        tag = classification["tag"]
+        class_conf = classification["confidence"]
         
-        # Queue the resolution task
-        task = run_resolve_task.delay(
-            ticket.text, 
-            classification["tag"], 
-            classification["confidence"]
+        new_ticket = Ticket(
+            status='pending',
+            content=ticket.text,
+            tag=tag
+        )
+        db.add(new_ticket)
+        await db.commit()
+        await db.refresh(new_ticket)
+        
+        task = run_resolve_task.apply_async(
+            args=[ticket.text, tag, class_conf],
+            task_id=f"ticket_{new_ticket.id}"
         )
         
-        # Return properly formatted response
         return TaskQueueResponse(
             task_id=task.id,
-            message=f"Resolution queued – poll /status/{task.id} for results",
+            message="Ticket queued for processing",
             status="queued",
-            tag=classification["tag"]
+            tag=tag
         )
+        
     except Exception as e:
+        await db.rollback()
         logger.error(f"Resolve endpoint error: {str(e)}")
-        raise HTTPException(status_code=500, detail=f"Failed to queue resolution: {str(e)}")
-
-
-@app.post("/escalate")
-async def escalate_endpoint(ticket: TicketInput):
-    try:
-        classification = classify_ticket(ticket.text)
-        crew = Crew(agents=[escalator_agent], tasks=[escalate_task], process=Process.sequential)
-
-        result = crew.kickoff(inputs={"ticket_text": ticket.text, "tag": classification["tag"]})
-        return {
-            "status": "escalated",
-            "summary": result.summary,
-            "suggested_department": result.suggested_department,
-            "priority": result.priority,
-            "tag": classification["tag"]
-        }
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Escalation failed: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Failed to queue ticket: {str(e)}")
 
 @app.get("/metrics")
 async def get_metrics(db: AsyncSession = Depends(get_db)):
+    """Return dashboard metrics"""
     try:
-        resolved = (await db.execute(select(func.count(Ticket.id)).where(Ticket.status.in_(['auto_resolved', 'human_resolved'])))).scalar() or 0
-        escalated = (await db.execute(select(func.count(Ticket.id)).where(Ticket.status == 'escalated'))).scalar() or 0
-        total_tickets = resolved + escalated
-        resolve_rate = round((resolved / total_tickets * 100), 1) if total_tickets > 0 else 0.0
-        escalate_rate = round((escalated / total_tickets * 100), 1) if total_tickets > 0 else 0.0
-# Rest unchanged
-
+        result = await db.execute(select(
+            func.count().filter(Ticket.status == 'resolved').label('resolved'),
+            func.count().filter(Ticket.status == 'escalated').label('escalated'),
+            func.count().label('total')
+        ))
+        row = result.one()
+        
+        total = row.total or 1
+        resolved_count = row.resolved or 0
+        escalated_count = row.escalated or 0
+        
         return {
-            'resolveRate': resolve_rate,
-            'escalateRate': escalate_rate,
-            'totalTickets': total_tickets,
-            'resolved': resolved,
-            'escalated': escalated
+            "totalTickets": total,
+            "resolved": resolved_count,
+            "escalated": escalated_count,
+            "resolveRate": round((resolved_count / total) * 100, 1) if total > 0 else 0,
+            "escalateRate": round((escalated_count / total) * 100, 1) if total > 0 else 0,
         }
     except Exception as e:
-        logger.error(f"Metrics error: {str(e)}")
+        logger.error(f"Metrics error: {e}")
         raise HTTPException(status_code=500, detail="Failed to fetch metrics")
 
-@app.get("/escalate")
-async def get_escalate_list(page: int = Query(1, ge=1), size: int = Query(10, ge=1, le=100), db: AsyncSession = Depends(get_db)):
+@app.get("/tickets/escalated")
+async def list_escalated_tickets(db: AsyncSession = Depends(get_db)):
+    """Return all escalated tickets"""
     try:
-        stmt = select(Ticket).where(Ticket.status == 'escalated').offset((page - 1) * size).limit(size)
-        results = await db.execute(stmt)
-        tickets = results.scalars().all()
-        total_stmt = select(func.count(Ticket.id)).where(Ticket.status == 'escalated')
-        total = (await db.execute(total_stmt)).scalar() or 0
-        return {"items": tickets, "total": total, "page": page, "size": size, "pages": (total + size - 1) // size}
+        result = await db.execute(
+            select(Ticket).where(Ticket.status == 'escalated').order_by(Ticket.id.desc())
+        )
+        tickets = result.scalars().all()
+        return {"items": [
+            {
+                "id": t.id,
+                "summary": t.summary,
+                "priority": t.priority,
+                "department": t.department,
+                "tag": t.tag
+            } for t in tickets
+        ]}
     except Exception as e:
-        logger.error(f"Escalate list error: {str(e)}")
+        logger.error(f"Escalated tickets error: {e}")
         raise HTTPException(status_code=500, detail="Failed to fetch escalated tickets")
 
-@app.get("/escalate/{id}", response_model=TicketDetail)
-async def get_escalate_detail(id: int, db: AsyncSession = Depends(get_db)):
+@app.get("/tickets/{ticket_id}", response_model=TicketDetail)
+async def get_ticket_detail(ticket_id: int, db: AsyncSession = Depends(get_db)):
+    """Get full ticket details by ID"""
     try:
-        stmt = select(Ticket).where(Ticket.id == id, Ticket.status == 'escalated')
-        result = await db.execute(stmt)
+        result = await db.execute(select(Ticket).where(Ticket.id == ticket_id))
         ticket = result.scalar_one_or_none()
+        
         if not ticket:
             raise HTTPException(status_code=404, detail="Ticket not found")
-        return ticket
+        
+        return TicketDetail(
+            id=ticket.id,
+            status=ticket.status,
+            content=ticket.content,
+            summary=ticket.summary,
+            priority=ticket.priority,
+            department=ticket.department,
+            tag=ticket.tag
+        )
+    except HTTPException:
+        raise
     except Exception as e:
-        logger.error(f"Escalate detail error: {str(e)}")
+        logger.error(f"Ticket detail error: {e}")
         raise HTTPException(status_code=500, detail="Failed to fetch ticket detail")
 
 @app.get("/kb")
-async def get_kb_list(page: int = Query(1, ge=1), size: int = Query(10, ge=1, le=100)):
+async def list_kb_entries(size: int = Query(50, ge=1, le=200)):
+    """Return all KB entries for dashboard"""
     try:
-        res = supabase.table('kb_entries').select('*').range((page - 1) * size, page * size - 1).execute()
-        entries = res.data
-        total_res = supabase.table('kb_entries').select('count(*)').execute()
-        total = total_res.data[0]['count'] if total_res.data else 0
-        return {"items": entries, "total": total, "page": page, "size": size, "pages": (total + size - 1) // size}
-    except Exception as e:  # ← Dedented to match try
-        logger.error(f"KB list error: {str(e)}")
+        response = supabase.table("kb_entries")\
+            .select("*")\
+            .order("created_at", desc=True)\
+            .limit(size)\
+            .execute()
+
+        items = response.data or []
+        
+        # Ensure file_url is always string (frontend expects it)
+        for item in items:
+            if item.get("file_url") is None:
+                item["file_url"] = ""
+
+        return {"items": items, "total": len(items)}
+    except Exception as e:
+        logger.error(f"KB list error: {e}")
         raise HTTPException(status_code=500, detail="Failed to fetch KB entries")
 
 @app.post("/kb")
-async def save_kb_entry(title: str = Form(...), content: str = Form(...), files: List[UploadFile] = File(None)):
+async def create_kb_entry(
+    title: str = Form(...), 
+    content: str = Form(...), 
+    files: List[UploadFile] = File(default=[])
+):
+    """Save new KB entry + upload files + generate embedding immediately"""
     try:
         file_urls = []
         
-        if files:
-            for file in files:
-                file_content = await file.read()
-                base_name, ext = os.path.splitext(file.filename)
-                safe_base_name = re.sub(r'[^\w\-.]', '_', base_name)
-                sanitized_filename = safe_base_name + ext
-                
-                upload_res = supabase.storage.from_('kb_uploads').upload(
-                    path=sanitized_filename,
-                    file=file_content,
-                    file_options={'content-type': file.content_type}
-                )
-                
-                if upload_res:
-                    url = supabase.storage.from_('kb_uploads').get_public_url(sanitized_filename)
-                    file_urls.append(url)
+        # --- File Upload Logic ---
+        for file in files:
+            # Simple sanitization
+            sanitized_filename = re.sub(r'[^a-zA-Z0-9_.-]', '_', file.filename)
+            file_content = await file.read()
+            
+            # Upload to Supabase storage
+            upload_res = supabase.storage.from_('kb_uploads').upload(
+                sanitized_filename, 
+                file_content, 
+                {'content-type': file.content_type}
+            )
+            # Get the public URL for the file
+            file_url_data = supabase.storage.from_('kb_uploads').get_public_url(sanitized_filename)
+            file_urls.append(file_url_data)
+        
+        file_urls_str = ",".join(file_urls)
 
-        file_url_str = ",".join(file_urls) if file_urls else None
-        
-        data = {'title': title, 'content': content, 'file_url': file_url_str}
-        insert_res = supabase.table('kb_entries').insert(data).execute()
-        if not insert_res.data:
-            raise ValueError("Insert failed")
-        new_entry = insert_res.data[0]
-        entry_id = new_entry['id']
-        
-        # Create embedding
-        embed_kb_entry(entry_id, title, content, file_url_str)
-        
-        # Fetch the entry again to get the embedding
-        updated_entry = supabase.table('kb_entries').select('*').eq('id', entry_id).single().execute()
-        
-        return updated_entry.data if updated_entry.data else new_entry
-        
+        # --- DB Insertion Logic ---
+        entry_data = {
+            "title": title,
+            "content": content,
+            "file_url": file_urls_str,
+            "embedding": None,  # Will be generated immediately
+        }
+
+        # Insert new entry
+        res = supabase.table('kb_entries').insert(entry_data).execute()
+
+        if res.data:
+            entry_id = res.data[0]['id']
+            
+            # Generate embedding immediately (uses Supabase pgvector)
+            embed_kb_entry(entry_id, title, content, file_urls_str)
+            
+            return {
+                "status": "success", 
+                "id": entry_id, 
+                "message": "KB entry saved and embedded successfully"
+            }
+        else:
+            raise Exception("Supabase insert failed to return data.")
+
     except Exception as e:
-        logger.error(f"KB save error: {str(e)}")
-        raise HTTPException(status_code=500, detail=f"Failed to save KB entry: {str(e)}")
+        logger.error(f"KB creation error: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Failed to create KB entry: {str(e)}")
 
 @app.post("/tickets/{id}/resolve")
 async def resolve_human_ticket(id: int, db: AsyncSession = Depends(get_db)):

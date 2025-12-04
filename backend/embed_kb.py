@@ -17,4 +17,4 @@ for entry in res.data:
     emb = embeddings.embed_query(text)
     supabase.table('kb_entries').update({'embedding': emb}).eq('id', entry['id']).execute()
 
-print("Embeddings added! Vectors ready to rumble.")
+print("Embeddings added! Vectors ready to rumble.") 

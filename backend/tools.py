@@ -1,66 +1,97 @@
+"""
+Fixed tools.py - Uses Supabase pgvector directly (no FAISS)
+"""
+from typing import Type, Any, Optional
 from crewai.tools import BaseTool
-from typing import Type, Any
 from pydantic import BaseModel, Field
-import docx
-from pymupdf import open as pdf_open
-from pytesseract import image_to_string
-from PIL import Image
+import os
+from langchain_openai import OpenAIEmbeddings
+from supabase import create_client
+
+# Initialize Supabase
+SUPABASE_URL = os.getenv('SUPABASE_URL')
+SUPABASE_KEY = os.getenv('SUPABASE_SERVICE_KEY') or os.getenv('SUPABASE_KEY')
+supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
+
+# Initialize embeddings
+embeddings = OpenAIEmbeddings(model="text-embedding-3-small")
 
 class SearchKBInput(BaseModel):
     """Input schema for SearchKBTool."""
-    query: str = Field(..., description="Search query for the knowledge base")
+    query: Optional[str] = Field(
+        None, 
+        description="The search query string to find relevant knowledge base entries. Example: 'password reset' or 'refund policy'"
+    )
 
 class SearchKBTool(BaseTool):
     name: str = "search_kb"
-    description: str = "Searches the knowledge base for similar entries and returns matches with confidence, including extracted content from attached files like Word, PDF, or images."
+    description: str = (
+        "Search the knowledge base using a query string. "
+        "Returns relevant KB entries with confidence scores. "
+        "Usage: search_kb(query='your search terms here')"
+    )
     args_schema: Type[BaseModel] = SearchKBInput
 
-    def _run(self, query: str) -> str:
-        """Searches the knowledge base."""
-        from main import vectorstore
-        
-        if vectorstore is None:
-            return "Knowledge base not loaded."
+    def _run(self, query: str = None, **kwargs) -> str:
+        """
+        Searches the knowledge base using Supabase pgvector.
+        NO FAISS - queries database directly for always-fresh results.
+        """
+        # Handle parameter variations
+        if query is None:
+            query = kwargs.get('description') or kwargs.get('search_query') or kwargs.get('q')
+            if query is None:
+                return "Error: No search query provided. Please provide a 'query' parameter."
         
         try:
-            results = vectorstore.similarity_search_with_score(query, k=3)
+            # Generate query embedding
+            query_embedding = embeddings.embed_query(query)
+            
+            # Search using Supabase pgvector RPC function
+            # This queries the database directly - always fresh!
+            result = supabase.rpc('match_kb_entries', {
+                'query_embedding': query_embedding,
+                'match_threshold': 0.7,  # Minimum similarity score
+                'match_count': 3  # Top 3 results
+            }).execute()
+            
+            if not result.data:
+                return "No relevant matches found in knowledge base."
+            
+            # Format results
             output = []
-            
-            for doc, score in results:
-                confidence = 1 - score
+            for match in result.data:
+                similarity = match.get('similarity', 0)
+                title = match.get('title', 'Untitled')
+                content = match.get('content', '')
+                file_url = match.get('file_url', '')
                 
-                # Extract from file if present
-                entry = doc.metadata.get('entry')
-                if entry and hasattr(entry, 'file_url') and entry.file_url:
-                    for url in entry.file_url.split(','):
-                        url = url.strip()
-                        try:
-                            file_path = url.replace('http://localhost:8000/', '')
-                            if url.endswith('.docx'):
-                                doc_file = docx.Document(file_path)
-                                extracted = '\n'.join(p.text for p in doc_file.paragraphs)
-                            elif url.endswith('.pdf'):
-                                with pdf_open(file_path) as pdf:
-                                    extracted = ''.join(page.get_text() for page in pdf)
-                            elif url.endswith(('.png', '.jpg', '.jpeg')):
-                                img = Image.open(file_path)
-                                extracted = image_to_string(img)
-                            else:
-                                extracted = ''
-                            
-                            if extracted:
-                                doc.page_content += f"\nExtracted from file: {extracted}"
-                        except Exception as e:
-                            print(f"Error extracting from {url}: {e}")
-                
+                # Determine confidence level
+                confidence = similarity
                 if confidence >= 0.82:
-                    output.append(f"High-confidence match ({confidence:.2f}): {doc.page_content}")
+                    confidence_label = "High-confidence"
+                    emoji = "✅"
                 else:
-                    output.append(f"Low-confidence match ({confidence:.2f}): {doc.page_content}")
+                    confidence_label = "Low-confidence"
+                    emoji = "⚠️"
+                
+                # Format entry
+                entry_text = f"{emoji} {confidence_label} match ({confidence:.2f}):\n"
+                entry_text += f"Title: {title}\n"
+                entry_text += f"Content: {content}\n"
+                
+                # Include file URLs if present
+                if file_url:
+                    entry_text += f"Attachments: {file_url}\n"
+                
+                output.append(entry_text)
             
-            return "\n\n".join(output) if output else "No relevant matches found."
+            return "\n" + ("-" * 50) + "\n\n".join(output)
+            
         except Exception as e:
-            return f"Error searching KB: {str(e)}"
+            error_msg = f"Error searching KB: {str(e)}"
+            print(error_msg)
+            return error_msg
 
 # Create instance
 search_kb = SearchKBTool()
