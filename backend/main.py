@@ -26,8 +26,9 @@ from typing import Optional, Literal
 from crewai import Agent, Task, Crew, Process
 from langchain_openai import ChatOpenAI
 from tools import search_kb
-from sqlalchemy import select, func, text
+from sqlalchemy import select, func, text, create_engine, update
 from sqlalchemy.ext.asyncio import create_async_engine, async_sessionmaker, AsyncSession
+from sqlalchemy.orm import sessionmaker
 import logging
 from fastapi.staticfiles import StaticFiles
 from classifier import classify_ticket
@@ -41,76 +42,88 @@ import datetime
 
 
 @app_celery.task
-def run_resolve_task(ticket_text: str, tag: str, class_conf: float):
-    # Rebuild everything fresh – no globals choking us
+def run_resolve_task(ticket_id: int, ticket_text: str, tag: str, class_conf: float):
+    # 1. Initialize AI Agents (Same as before)
     from crewai import Agent, Task, Crew, Process
     from langchain_openai import ChatOpenAI
-    from tools import search_kb  # Your KB tool
-    from pydantic import BaseModel, Field
-    llm = ChatOpenAI(model="gpt-4o-mini", temperature=0.0)
-
-    resolver_agent = Agent(
-        role="Senior Ticket Resolver", 
-        goal="Resolve only when KB match ≥0.82. Never guess or hallucinate.",
-        backstory="10+ years in support, knows every edge case of our product.",
-        tools=[search_kb],
-        llm=llm,
-        allow_delegation=False,
-        verbose=True
-    )
-
-    resolve_task = Task(
-        description="""
-        1. Use search_kb tool (multiple calls allowed).
-        2. Only if highest_confidence ≥ 0.82 craft polite, complete reply.
-        3. Otherwise resolved=false.
-        Ticket: {ticket_text}
-        Tag: {tag} (class confidence {class_conf:.2f})
-        """,
-        agent=resolver_agent,
-        expected_output="JSON matching ResolveOutput",
-        output_pydantic=ResolveOutput
-    )
-
-    crew = Crew(agents=[resolver_agent], tasks=[resolve_task], process=Process.sequential, verbose=True)
-    crew_output = crew.kickoff(inputs={"ticket_text": ticket_text, "tag": tag, "class_conf": class_conf})
-
-    #FIX: Force to plain, serializable dict - no Pydantic residue
-    if hasattr(crew_output, 'pydantic') and crew_output.pydantic:
-        result = {
-            "resolved": crew_output.pydantic.resolved,
-            "reply": crew_output.pydantic.reply,
-            "confidence": crew_output.pydantic.confidence
-        }
-    else:
-        result = {
-            "resolved": False,
-            "reply": None,
-            "confidence": 0.0,
-            "error": "Failed to generate structured output"
-        }
-    
+    from tools import search_kb
     import json
-    return json.loads(json.dumps(result))  # Nukes any non-JSON junk
-    
-    # Make sure we never return a ResolveOutput object, only a dict
-    result_model = getattr(crew_output, "pydantic", None)
-    
-    if isinstance(result_model, BaseModel):
-        # Pydantic v2 uses model_dump, v1 uses dict
-        if hasattr(result_model, "model_dump"):
-            return result_model.model_dump()
-        else:
-            return result_model.dict()
-    else:
-        # Fallback if the LLM failed to generate valid JSON
-        return {
-            "resolved": False, 
-            "reply": None, 
-            "confidence": 0.0, 
-            "error": "Failed to generate structured output"
-        } 
 
+    # 2. Define the Sync DB Connection (Required for Celery)
+    # We create a fresh connection for this specific task
+    SYNC_DATABASE_URL = os.getenv("DATABASE_URL").replace("postgresql+asyncpg", "postgresql")
+    engine_sync = create_engine(SYNC_DATABASE_URL)
+    SessionSync = sessionmaker(bind=engine_sync)
+    session = SessionSync()
+
+    try:
+        llm = ChatOpenAI(model="gpt-4o-mini", temperature=0.0)
+
+        # --- AGENT DEFINITION (Keep your existing logic) ---
+        resolver_agent = Agent(
+            role="Senior Ticket Resolver", 
+            goal="Resolve only when KB match ≥0.82. Never guess.",
+            backstory="Expert support agent.",
+            tools=[search_kb],
+            llm=llm,
+            allow_delegation=False,
+            verbose=True
+        )
+
+        resolve_task = Task(
+            description=f"""
+            1. Use search_kb tool.
+            2. If confidence >= 0.82, return resolved=true and a reply.
+            3. If confidence < 0.82, return resolved=false.
+            Ticket: {ticket_text}
+            """,
+            agent=resolver_agent,
+            expected_output="JSON with resolved(bool), reply(str), confidence(float)"
+        )
+
+        crew = Crew(agents=[resolver_agent], tasks=[resolve_task], verbose=True)
+        crew_output = crew.kickoff()
+
+        # --- PARSE OUTPUT ---
+        # Safe parsing logic
+        try:
+            if hasattr(crew_output, 'pydantic') and crew_output.pydantic:
+                data = crew_output.pydantic.dict()
+            elif isinstance(crew_output, str):
+                # Sometimes CrewAI returns a string even if we asked for JSON
+                clean_json = crew_output.strip('`').replace('json\n', '')
+                data = json.loads(clean_json)
+            else:
+                data = json.loads(str(crew_output))
+        except:
+            # If parsing fails, default to escalation
+            data = {"resolved": False, "confidence": 0.0, "reply": None}
+
+        # --- CRITICAL FIX: WRITE TO DATABASE ---
+        print(f"💾 Saving result for Ticket #{ticket_id}: {data}")
+
+        new_status = 'resolved' if data.get('resolved') else 'escalated'
+
+        # Update the ticket row
+        stmt = update(Ticket).where(Ticket.id == ticket_id).values(
+            status=new_status,
+            summary=data.get('reply') if new_status == 'resolved' else "Requires human attention",
+            priority='High' if new_status == 'escalated' else 'Low'
+        )
+        session.execute(stmt)
+        session.commit()
+
+        return data
+
+    except Exception as e:
+        session.rollback()
+        print(f"❌ Task Error: {e}")
+        # Fallback: Escalate on error
+        stmt = update(Ticket).where(Ticket.id == ticket_id).values(status='escalated')
+        session.execute(stmt)
+        session.commit()
+    finally:
+        session.close() 
 
 supabase: Client = create_client(os.getenv("SUPABASE_URL"), os.getenv("SUPABASE_KEY"))
 # Quick test: print(supabase.table('kb_entries').select('count(*)').execute())  # Comment out after
@@ -236,6 +249,8 @@ escalate_task = Task(
 )
 
 # ================================== FASTAPI APP ==================================
+# TEMPORARY CHECK
+print("Server is loading API_KEY:", os.getenv('API_KEY'))
 
 app = FastAPI(title="Support Swarm Backend")
 app.add_middleware(
@@ -289,7 +304,8 @@ async def resolve_endpoint(
         await db.refresh(new_ticket)
         
         task = run_resolve_task.apply_async(
-            args=[ticket.text, tag, class_conf],
+            # CRITICAL: Added new_ticket.id as the first argument
+            args=[new_ticket.id, ticket.text, tag, class_conf],
             task_id=f"ticket_{new_ticket.id}"
         )
         
@@ -307,8 +323,10 @@ async def resolve_endpoint(
 
 @app.get("/metrics")
 async def get_metrics(db: AsyncSession = Depends(get_db)):
-    """Return dashboard metrics"""
+    """Return dashboard metrics with Tag Breakdown"""
     try:
+        # 1. Get Basic Counts
+        # We use db.execute (not session.execute)
         result = await db.execute(select(
             func.count().filter(Ticket.status == 'resolved').label('resolved'),
             func.count().filter(Ticket.status == 'escalated').label('escalated'),
@@ -316,7 +334,50 @@ async def get_metrics(db: AsyncSession = Depends(get_db)):
         ))
         row = result.one()
         
-        total = row.total or 1
+        # 2. Get Tag Breakdown (For the Donut Chart)
+        # FIX: Changed 'session.execute' to 'db.execute'
+        tag_result = await db.execute(
+            select(Ticket.tag, func.count(Ticket.id))
+            .where(Ticket.tag.is_not(None))  # Filter out null tags
+            .group_by(Ticket.tag)
+        )
+        tags_data = tag_result.all()
+        
+        # 3. Tag Configuration with Display Names and Colors
+        tag_config = {
+            "bug": {"display": "Bug Report", "color": "#ef4444"},
+            "refund": {"display": "Refund Inquiry", "color": "#f97316"},
+            "feature": {"display": "Feature Request", "color": "#0d9488"},
+            "billing": {"display": "Billing Issue", "color": "#8b5cf6"},
+            "account": {"display": "Account Access", "color": "#facc15"},
+            "general": {"display": "General Question", "color": "#10b981"},
+            # Support old formats
+            "general_inquiry": {"display": "General Question", "color": "#10b981"},
+            "billing_issue": {"display": "Billing Issue", "color": "#8b5cf6"},
+            "feature_request": {"display": "Feature Request", "color": "#0d9488"},
+            "account_issue": {"display": "Account Access", "color": "#facc15"}
+        }
+        
+        # 4. Format tag breakdown for frontend
+        tag_breakdown = []
+        for tag, count in tags_data:
+            # Handle potential None or empty strings
+            if not tag: 
+                continue
+                
+            config = tag_config.get(tag, {
+                "display": tag.replace("_", " ").title(),
+                "color": "#6b7280" # Default gray
+            })
+            
+            tag_breakdown.append({
+                "name": tag,
+                "displayName": config["display"],
+                "value": count,
+                "color": config["color"]
+            })
+        
+        total = row.total or 0
         resolved_count = row.resolved or 0
         escalated_count = row.escalated or 0
         
@@ -326,11 +387,13 @@ async def get_metrics(db: AsyncSession = Depends(get_db)):
             "escalated": escalated_count,
             "resolveRate": round((resolved_count / total) * 100, 1) if total > 0 else 0,
             "escalateRate": round((escalated_count / total) * 100, 1) if total > 0 else 0,
+            "tagBreakdown": tag_breakdown
         }
     except Exception as e:
         logger.error(f"Metrics error: {e}")
+        # This print will help you see the real error in your terminal
+        print(f"❌ METRICS ERROR: {e}") 
         raise HTTPException(status_code=500, detail="Failed to fetch metrics")
-
 @app.get("/tickets/escalated")
 async def list_escalated_tickets(db: AsyncSession = Depends(get_db)):
     """Return all escalated tickets"""

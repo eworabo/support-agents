@@ -28,15 +28,15 @@ classification_task = Task(
     description="""
 Classify the ticket into EXACTLY ONE category (lowercase only):
 
-bug | feature_request | refund | billing_issue | account_issue | general_inquiry
+bug | feature | refund | billing | account | general
 
 Strict rules (memorized from our actual product data):
 - Crash, error, broken feature, not working → bug
-- Wants new feature, improvement, "it would be nice if" → feature_request
+- Wants new feature, improvement, "it would be nice if" → feature
 - Wants money back, cancel + refund, accidental purchase → refund
-- Charged twice/wrong amount, payment failed but deducted, subscription price → billing_issue
-- Login, password, 2FA, email verification, account locked → account_issue
-- How-to, status check, general question → general_inquiry
+- Charged twice/wrong amount, payment failed but deducted, subscription price → billing
+- Login, password, 2FA, email verification, account locked → account
+- How-to, status check, general question → general
 
 Output ONLY the category word. Nothing else. No quotes. No explanation.
 
@@ -65,8 +65,8 @@ def classify_ticket(ticket_text: str) -> dict:  # ← Changed from str to dict
     category = str(result).strip().lower()
     
     allowed = {
-        "bug", "feature_request", "refund",
-        "billing_issue", "account_issue", "general_inquiry"
+        "bug", "feature", "refund",
+        "billing", "account", "general"
     }
     if category not in allowed:
         raise ValueError(f"Classifier returned invalid category: {category}")
